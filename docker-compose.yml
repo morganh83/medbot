@@ -1,0 +1,46 @@
+version: '3.8'
+
+services:
+  medbot:
+    build:
+      context: .
+      dockerfile: Dockerfile
+    container_name: medbot
+    restart: unless-stopped
+
+    # Environment variables from .env file
+    env_file:
+      - .env
+
+    # Port mapping (only bind to localhost for security)
+    ports:
+      - "127.0.0.1:8080:8080"
+
+    # Volume mounts for persistent data
+    volumes:
+      - ./data:/app/data
+
+    # Logging configuration
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
+
+    # Resource limits
+    deploy:
+      resources:
+        limits:
+          cpus: '1'
+          memory: 512M
+        reservations:
+          cpus: '0.5'
+          memory: 256M
+
+    # Health check
+    healthcheck:
+      test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8080/health').read()"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+      start_period: 40s

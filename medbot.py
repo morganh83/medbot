@@ -873,6 +873,20 @@ async def handle_book(request: web.Request):
 
 
 # =========================
+# Health check endpoint
+# =========================
+
+
+async def health_check(request: web.Request):
+    """Health check endpoint for Docker and monitoring."""
+    return web.json_response({
+        "status": "healthy",
+        "bot_ready": client.is_ready(),
+        "timestamp": utc_now_iso()
+    })
+
+
+# =========================
 # GPS quick link web flow
 # =========================
 
@@ -1046,6 +1060,7 @@ async def gps_report(request: web.Request):
 
 async def start_web_server():
     app = web.Application()
+    app.router.add_get("/health", health_check)
     app.router.add_post("/webhook/join", handle_join)
     app.router.add_post("/webhook/book", handle_book)
 

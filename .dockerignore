@@ -1,0 +1,46 @@
+# Version control
+.git
+.gitignore
+
+# Python
+__pycache__/
+*.py[cod]
+*$py.class
+*.so
+.Python
+venv/
+env/
+ENV/
+.venv
+
+# Database (will be in volume)
+*.db
+*.db-journal
+
+# Logs
+*.log
+
+# Environment files (use docker-compose env_file)
+.env
+.env.*
+
+# IDE
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# Documentation
+README.md
+*.md
+
+# CSV exports (will be in volume if needed)
+*.csv
+
+# Docker files themselves
+Dockerfile
+docker-compose.yml
+.dockerignore
+
+# Data directory (mounted as volume)
+data/
