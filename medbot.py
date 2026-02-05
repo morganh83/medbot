@@ -44,6 +44,12 @@ WEB_BIND_PORT = int(os.getenv("WEB_BIND_PORT", "8080"))
 # Your website must send header: X-MedBot-Secret: <secret>
 WEBHOOK_SHARED_SECRET = os.getenv("WEBHOOK_SHARED_SECRET", "CHANGE_ME")
 
+# LocationIQ API key for GPS location services (free tier available)
+LOCATIONIQ_API_KEY = os.getenv("LOCATIONIQ_API_KEY", "")
+
+# Discord role ID required to resolve incidents (optional - if not set, uses manage_messages permission)
+DISPATCH_ROLE_ID = int(os.getenv("DISPATCH_ROLE_ID", "0"))
+
 DB_PATH = os.getenv("DB_PATH", "medbot.db")
 
 EXPORT_CSV = os.getenv("EXPORT_CSV", "true").lower() == "true"
@@ -72,7 +78,12 @@ CREATE TABLE IF NOT EXISTS incidents (
     status TEXT NOT NULL,
     discord_message_id INTEGER,
     discord_channel_id INTEGER,
-    discord_thread_id INTEGER
+    discord_thread_id INTEGER,
+    resolved_at_utc TEXT,
+    resolved_by_user_id INTEGER,
+    resolved_by_name TEXT,
+    care_provided TEXT,
+    archived INTEGER DEFAULT 0
 );
 
 CREATE TABLE IF NOT EXISTS incident_responders (
@@ -102,6 +113,38 @@ CREATE TABLE IF NOT EXISTS incident_location_reports (
     accuracy_m REAL,
     created_at_utc TEXT NOT NULL,
     FOREIGN KEY (incident_db_id) REFERENCES incidents(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS incident_messages (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_db_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    author_id INTEGER NOT NULL,
+    author_name TEXT NOT NULL,
+    content TEXT,
+    created_at_utc TEXT NOT NULL,
+    FOREIGN KEY (incident_db_id) REFERENCES incidents(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS incident_files (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    incident_db_id INTEGER NOT NULL,
+    message_id INTEGER NOT NULL,
+    filename TEXT NOT NULL,
+    url TEXT NOT NULL,
+    content_type TEXT,
+    size_bytes INTEGER,
+    created_at_utc TEXT NOT NULL,
+    FOREIGN KEY (incident_db_id) REFERENCES incidents(id) ON DELETE CASCADE
+);
+
+CREATE TABLE IF NOT EXISTS location_share_tokens (
+    token TEXT PRIMARY KEY,
+    channel_id INTEGER NOT NULL,
+    user_id INTEGER NOT NULL,
+    user_name TEXT NOT NULL,
+    created_at_utc TEXT NOT NULL,
+    expires_at_utc TEXT NOT NULL
 );
 """
 
@@ -283,6 +326,212 @@ async def db_insert_location_report(
         await db.commit()
 
 
+async def db_create_location_share_token(
+    channel_id: int, user_id: int, user_name: str
+) -> str:
+    """Create a temporary token for location sharing in any channel."""
+    token = secrets.token_urlsafe(24)
+    created_at = dt.datetime.utcnow()
+    expires_at = created_at + dt.timedelta(hours=24)  # 24 hour expiry
+
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO location_share_tokens (token, channel_id, user_id, user_name, created_at_utc, expires_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            """,
+            (
+                token,
+                channel_id,
+                user_id,
+                user_name,
+                created_at.isoformat() + "Z",
+                expires_at.isoformat() + "Z",
+            ),
+        )
+        await db.commit()
+    return token
+
+
+async def db_get_location_share_token(token: str) -> Optional[Dict[str, Any]]:
+    """Get location share token if valid and not expired."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            """
+            SELECT * FROM location_share_tokens
+            WHERE token = ? AND datetime(expires_at_utc) > datetime('now')
+            """,
+            (token,),
+        )
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def db_archive_incident(
+    db_id: int,
+    resolved_by_user_id: int,
+    resolved_by_name: str,
+    care_provided: str,
+):
+    """Mark incident as resolved and archived with care notes."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE incidents
+            SET status = 'resolved',
+                resolved_at_utc = ?,
+                resolved_by_user_id = ?,
+                resolved_by_name = ?,
+                care_provided = ?,
+                archived = 1
+            WHERE id = ?
+            """,
+            (utc_now_iso(), resolved_by_user_id, resolved_by_name, care_provided, db_id),
+        )
+        await db.commit()
+
+
+async def db_archive_messages(db_id: int, messages: List[Dict[str, Any]]):
+    """Archive messages from incident thread."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for msg in messages:
+            await db.execute(
+                """
+                INSERT INTO incident_messages
+                (incident_db_id, message_id, author_id, author_name, content, created_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    db_id,
+                    msg["message_id"],
+                    msg["author_id"],
+                    msg["author_name"],
+                    msg["content"],
+                    msg["created_at_utc"],
+                ),
+            )
+        await db.commit()
+
+
+async def db_archive_files(db_id: int, files: List[Dict[str, Any]]):
+    """Archive file attachments from incident thread."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        for file in files:
+            await db.execute(
+                """
+                INSERT INTO incident_files
+                (incident_db_id, message_id, filename, url, content_type, size_bytes, created_at_utc)
+                VALUES (?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    db_id,
+                    file["message_id"],
+                    file["filename"],
+                    file["url"],
+                    file.get("content_type"),
+                    file.get("size_bytes"),
+                    file["created_at_utc"],
+                ),
+            )
+        await db.commit()
+
+
+async def db_search_incidents(
+    keyword: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+    incident_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    limit: int = 20,
+    offset: int = 0,
+) -> List[Dict[str, Any]]:
+    """Search archived incidents with filters."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        conditions = ["archived = 1"]
+        params: List[Any] = []
+
+        if keyword:
+            conditions.append(
+                "(location LIKE ? OR patient_desc LIKE ? OR reported_injury LIKE ? OR notes LIKE ? OR care_provided LIKE ?)"
+            )
+            keyword_pattern = f"%{keyword}%"
+            params.extend([keyword_pattern] * 5)
+
+        if date_from:
+            conditions.append("created_at_utc >= ?")
+            params.append(date_from)
+
+        if date_to:
+            conditions.append("created_at_utc <= ?")
+            params.append(date_to)
+
+        if incident_id:
+            conditions.append("incident_id LIKE ?")
+            params.append(f"%{incident_id}%")
+
+        if severity:
+            conditions.append("severity LIKE ?")
+            params.append(f"%{severity}%")
+
+        where_clause = " AND ".join(conditions)
+        query = f"""
+            SELECT * FROM incidents
+            WHERE {where_clause}
+            ORDER BY created_at_utc DESC
+            LIMIT ? OFFSET ?
+        """
+        params.extend([limit, offset])
+
+        cur = await db.execute(query, tuple(params))
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_get_incident_archive(db_id: int) -> Optional[Dict[str, Any]]:
+    """Get complete archived incident with messages, files, and responders."""
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+
+        # Get incident details
+        cur = await db.execute("SELECT * FROM incidents WHERE id = ?", (db_id,))
+        incident = await cur.fetchone()
+        if not incident:
+            return None
+
+        incident_dict = dict(incident)
+
+        # Get responders
+        cur = await db.execute(
+            "SELECT * FROM incident_responders WHERE incident_db_id = ?", (db_id,)
+        )
+        incident_dict["responders"] = [dict(r) for r in await cur.fetchall()]
+
+        # Get messages
+        cur = await db.execute(
+            "SELECT * FROM incident_messages WHERE incident_db_id = ? ORDER BY created_at_utc",
+            (db_id,),
+        )
+        incident_dict["messages"] = [dict(r) for r in await cur.fetchall()]
+
+        # Get files
+        cur = await db.execute(
+            "SELECT * FROM incident_files WHERE incident_db_id = ?", (db_id,)
+        )
+        incident_dict["files"] = [dict(r) for r in await cur.fetchall()]
+
+        # Get location reports
+        cur = await db.execute(
+            "SELECT * FROM incident_location_reports WHERE incident_db_id = ? ORDER BY created_at_utc",
+            (db_id,),
+        )
+        incident_dict["locations"] = [dict(r) for r in await cur.fetchall()]
+
+        return incident_dict
+
+
 async def export_incidents_to_csv():
     if not EXPORT_CSV:
         return
@@ -410,18 +659,219 @@ def build_dispatch_embed(
 # =========================
 
 
+class IncidentSearchView(discord.ui.View):
+    """View for incident search results with dropdown to view details."""
+
+    def __init__(self, incidents: List[Dict[str, Any]]):
+        super().__init__(timeout=300)  # 5 minute timeout
+        self.incidents = incidents
+
+        # Add dropdown with incident options
+        options = [
+            discord.SelectOption(
+                label=inc["incident_id"],
+                description=f"{inc['status']} - {inc['location'][:50] if inc['location'] else 'No location'}",
+                value=str(inc["id"]),
+            )
+            for inc in incidents[:25]  # Discord limit
+        ]
+
+        select = discord.ui.Select(
+            placeholder="Select an incident to view full details...",
+            options=options,
+            custom_id="incident_select",
+        )
+        select.callback = self.select_callback
+        self.add_item(select)
+
+    async def select_callback(self, interaction: discord.Interaction):
+        """Handle incident selection and show full details."""
+        selected_id = int(interaction.data["values"][0])
+
+        # Get full archived incident data
+        archive = await db_get_incident_archive(selected_id)
+        if not archive:
+            await interaction.response.send_message(
+                "Could not find incident details.", ephemeral=True
+            )
+            return
+
+        # Build detailed embed
+        embed = discord.Embed(
+            title=f"Incident {archive['incident_id']}",
+            description=f"**Status:** {archive['status']}",
+            color=discord.Color.green()
+            if archive["status"] == "resolved"
+            else discord.Color.red(),
+        )
+
+        embed.add_field(
+            name="Reporter", value=archive.get("reporter_name") or "Unknown", inline=True
+        )
+        embed.add_field(
+            name="Created", value=archive["created_at_utc"][:16], inline=True
+        )
+        embed.add_field(
+            name="Severity", value=archive.get("severity") or "N/A", inline=True
+        )
+
+        if archive.get("location"):
+            embed.add_field(
+                name="Location", value=archive["location"], inline=False
+            )
+
+        if archive.get("patient_desc"):
+            embed.add_field(
+                name="Patient Description", value=archive["patient_desc"][:1024], inline=False
+            )
+
+        if archive.get("reported_injury"):
+            embed.add_field(
+                name="Reported Injury", value=archive["reported_injury"][:1024], inline=False
+            )
+
+        if archive.get("care_provided"):
+            embed.add_field(
+                name="Care Provided", value=archive["care_provided"][:1024], inline=False
+            )
+
+        # Responders
+        if archive.get("responders"):
+            responders_text = "\n".join(
+                f"• {r['user_name']} ({r['role']}) - {r['status']}"
+                for r in archive["responders"]
+            )
+            embed.add_field(
+                name="Responders", value=responders_text[:1024], inline=False
+            )
+
+        # Location reports
+        if archive.get("locations"):
+            locations_text = "\n".join(
+                f"• {loc['label'] or 'Unknown'}: {loc['lat']:.6f}, {loc['lon']:.6f}"
+                for loc in archive["locations"]
+            )
+            embed.add_field(
+                name="GPS Locations", value=locations_text[:1024], inline=False
+            )
+
+        # Message count
+        if archive.get("messages"):
+            embed.add_field(
+                name="Messages", value=f"{len(archive['messages'])} messages archived", inline=True
+            )
+
+        # File count
+        if archive.get("files"):
+            embed.add_field(
+                name="Files", value=f"{len(archive['files'])} files archived", inline=True
+            )
+
+        if archive.get("resolved_at_utc"):
+            embed.add_field(
+                name="Resolved",
+                value=f"{archive['resolved_at_utc'][:16]} by {archive.get('resolved_by_name') or 'Unknown'}",
+                inline=False,
+            )
+
+        await interaction.response.send_message(embed=embed, ephemeral=True)
+
+
+class CareNotesModal(discord.ui.Modal, title="Incident Care Summary"):
+    """Modal for capturing care provided notes when resolving an incident."""
+
+    care_notes = discord.ui.TextInput(
+        label="Care Provided",
+        placeholder="Describe the care provided (e.g., bandaged laceration, provided water, monitored vitals)...",
+        style=discord.TextStyle.paragraph,
+        required=True,
+        max_length=2000,
+    )
+
+    def __init__(self, db_id: int, incident_id: str, view: "DispatchView"):
+        super().__init__()
+        self.db_id = db_id
+        self.incident_id = incident_id
+        self.view = view
+
+    async def on_submit(self, interaction: discord.Interaction):
+        care_provided = self.care_notes.value
+
+        # Archive incident with care notes
+        await db_archive_incident(
+            self.db_id,
+            interaction.user.id,
+            interaction.user.display_name,
+            care_provided,
+        )
+
+        # Try to archive messages and files from thread
+        try:
+            incident = await db_get_incident_by_incident_id(self.incident_id)
+            if incident and incident.get("discord_thread_id"):
+                thread = interaction.guild.get_thread(
+                    int(incident["discord_thread_id"])
+                )
+                if thread:
+                    messages_data = []
+                    files_data = []
+
+                    async for message in thread.history(limit=500):
+                        messages_data.append(
+                            {
+                                "message_id": message.id,
+                                "author_id": message.author.id,
+                                "author_name": message.author.display_name,
+                                "content": message.content or "",
+                                "created_at_utc": message.created_at.isoformat() + "Z",
+                            }
+                        )
+
+                        for attachment in message.attachments:
+                            files_data.append(
+                                {
+                                    "message_id": message.id,
+                                    "filename": attachment.filename,
+                                    "url": attachment.url,
+                                    "content_type": attachment.content_type,
+                                    "size_bytes": attachment.size,
+                                    "created_at_utc": message.created_at.isoformat()
+                                    + "Z",
+                                }
+                            )
+
+                    await db_archive_messages(self.db_id, messages_data)
+                    await db_archive_files(self.db_id, files_data)
+        except Exception as e:
+            print(f"Warning: Could not archive thread history: {e}")
+
+        await interaction.response.send_message(
+            f"Incident **{self.incident_id}** marked resolved and archived.",
+            ephemeral=True,
+        )
+
+        target = await self.view.get_update_target(interaction)
+        await target.send(
+            f"Incident **{self.incident_id}** marked **resolved** by {interaction.user.mention}.\n"
+            f"**Care provided:** {care_provided}"
+        )
+
+        # Disable all buttons except GPS link
+        for child in self.view.children:
+            if isinstance(child, discord.ui.Button):
+                if child.style != discord.ButtonStyle.link:
+                    child.disabled = True
+
+        await interaction.message.edit(view=self.view)
+        await export_incidents_to_csv()
+
+
 class DispatchView(discord.ui.View):
     def __init__(self, db_id: int, incident_id: str, gps_url: str):
         super().__init__(timeout=None)
         self.db_id = db_id
         self.incident_id = incident_id
-
-        # Link button for GPS page (works outside Discord).
-        self.add_item(
-            discord.ui.Button(
-                label="Share GPS", style=discord.ButtonStyle.link, url=gps_url
-            )
-        )
+        self.gps_url = gps_url
 
     async def get_update_target(
         self, interaction: discord.Interaction
@@ -471,10 +921,12 @@ class DispatchView(discord.ui.View):
             return existing["role"]
         return preferred_role
 
+    # ROW 0: Response buttons
     @discord.ui.button(
         label="Claim (Primary)",
         style=discord.ButtonStyle.danger,
         custom_id="dispatch_claim_primary",
+        row=0,
     )
     async def claim_primary(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -514,6 +966,7 @@ class DispatchView(discord.ui.View):
         label="Join (Additional)",
         style=discord.ButtonStyle.primary,
         custom_id="dispatch_join_additional",
+        row=0,
     )
     async def join_additional(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -540,10 +993,12 @@ class DispatchView(discord.ui.View):
             note=f"{interaction.user.display_name} joined as additional (en route).",
         )
 
+    # ROW 1: Action/Status buttons
     @discord.ui.button(
         label="On Scene",
         style=discord.ButtonStyle.secondary,
         custom_id="dispatch_on_scene",
+        row=1,
     )
     async def on_scene(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -573,6 +1028,7 @@ class DispatchView(discord.ui.View):
         label="Request Backup",
         style=discord.ButtonStyle.secondary,
         custom_id="dispatch_request_backup",
+        row=1,
     )
     async def request_backup(
         self, interaction: discord.Interaction, button: discord.ui.Button
@@ -593,37 +1049,77 @@ class DispatchView(discord.ui.View):
         )
 
     @discord.ui.button(
-        label="Resolved",
-        style=discord.ButtonStyle.success,
-        custom_id="dispatch_resolved",
+        label="Share GPS",
+        style=discord.ButtonStyle.primary,
+        custom_id="dispatch_share_gps",
+        row=1,
     )
-    async def resolved(
+    async def share_gps_button(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        if not interaction.user.guild_permissions.manage_messages:
-            await interaction.response.send_message(
-                "You do not have permission to resolve incidents.", ephemeral=True
-            )
-            return
-
-        await db_set_status(self.db_id, "resolved")
+        """Share GPS location button - sends link to GPS page."""
         await interaction.response.send_message(
-            f"Incident **{self.incident_id}** marked resolved.", ephemeral=True
+            f"GPS sharing link: {self.gps_url}\n\nOpen this link on your device to share your precise location.",
+            ephemeral=True,
+        )
+
+    # ROW 2: Resolution buttons
+    @discord.ui.button(
+        label="Escalating",
+        style=discord.ButtonStyle.danger,
+        custom_id="dispatch_escalating",
+        row=2,
+    )
+    async def escalating(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        """Escalating button - indicates advanced medical care needed."""
+        await db_set_status(self.db_id, "escalated")
+
+        await interaction.response.send_message(
+            f"Incident **{self.incident_id}** marked as escalating (advanced care needed).",
+            ephemeral=True,
         )
 
         target = await self.get_update_target(interaction)
         await target.send(
-            f"Incident **{self.incident_id}** marked **resolved** by {interaction.user.mention}."
+            f"⚠️ Incident **{self.incident_id}** escalated by {interaction.user.mention}. Advanced medical care needed."
         )
 
-        for child in self.children:
-            if isinstance(child, discord.ui.Button):
-                # Leave Share GPS link visible if you want, or disable everything.
-                if child.style != discord.ButtonStyle.link:
-                    child.disabled = True
+        await self.refresh_embed(
+            interaction,
+            note=f"⚠️ Escalated by {interaction.user.display_name} - advanced care needed.",
+        )
 
-        await interaction.message.edit(view=self)
-        await export_incidents_to_csv()
+    @discord.ui.button(
+        label="Resolved",
+        style=discord.ButtonStyle.success,
+        custom_id="dispatch_resolved",
+        row=2,
+    )
+    async def resolved(
+        self, interaction: discord.Interaction, button: discord.ui.Button
+    ):
+        """Resolved button - requires role and prompts for care notes."""
+        # Check permissions: either DISPATCH_ROLE_ID or manage_messages
+        has_permission = False
+        if DISPATCH_ROLE_ID:
+            has_permission = any(
+                role.id == DISPATCH_ROLE_ID for role in interaction.user.roles
+            )
+        else:
+            has_permission = interaction.user.guild_permissions.manage_messages
+
+        if not has_permission:
+            await interaction.response.send_message(
+                "You do not have permission to resolve incidents. Contact dispatch.",
+                ephemeral=True,
+            )
+            return
+
+        # Show modal for care notes
+        modal = CareNotesModal(self.db_id, self.incident_id, self)
+        await interaction.response.send_modal(modal)
 
 
 # =========================
@@ -780,6 +1276,118 @@ async def backup(
     await interaction.followup.send("Backup request posted.", ephemeral=True)
 
 
+@tree.command(
+    name="share-location",
+    description="Share your GPS location in this channel (opens web page to capture location).",
+)
+async def share_location(interaction: discord.Interaction):
+    """
+    Share GPS location command - generates a temporary GPS link for any channel.
+    Works like the incident GPS button but can be used anywhere.
+    """
+    # Create a temporary token for this location share
+    token = await db_create_location_share_token(
+        interaction.channel_id, interaction.user.id, interaction.user.display_name
+    )
+    gps_url = f"{PUBLIC_BASE_URL}/location-share?token={token}"
+
+    await interaction.response.send_message(
+        f"Click to share your location: {gps_url}\n\n"
+        f"This link will post your precise GPS coordinates to this channel when you open it on your device.\n"
+        f"Link expires in 24 hours.",
+        ephemeral=True,
+    )
+
+
+@tree.command(
+    name="incident-search",
+    description="Search archived incidents by keyword, date, or incident ID.",
+)
+@app_commands.describe(
+    keyword="Search in location, injury, notes, or care provided.",
+    incident_id="Search by incident ID (partial match).",
+    severity="Filter by severity level.",
+    date_from="Start date (YYYY-MM-DD).",
+    date_to="End date (YYYY-MM-DD).",
+)
+async def incident_search(
+    interaction: discord.Interaction,
+    keyword: Optional[str] = None,
+    incident_id: Optional[str] = None,
+    severity: Optional[str] = None,
+    date_from: Optional[str] = None,
+    date_to: Optional[str] = None,
+):
+    """Search archived incidents with various filters."""
+    await interaction.response.defer(ephemeral=True)
+
+    try:
+        results = await db_search_incidents(
+            keyword=keyword,
+            date_from=date_from,
+            date_to=date_to,
+            incident_id=incident_id,
+            severity=severity,
+            limit=10,
+            offset=0,
+        )
+
+        if not results:
+            await interaction.followup.send(
+                "No incidents found matching your search criteria.", ephemeral=True
+            )
+            return
+
+        # Build result embed
+        embed = discord.Embed(
+            title="Incident Search Results",
+            description=f"Found {len(results)} incident(s)",
+            color=discord.Color.blue(),
+        )
+
+        for inc in results[:10]:  # Limit to 10 results
+            status_emoji = (
+                "✅" if inc["status"] == "resolved" else "⚠️" if inc["status"] == "escalated" else "🔵"
+            )
+            field_value = (
+                f"**Status:** {status_emoji} {inc['status']}\n"
+                f"**Location:** {inc['location'] or 'N/A'}\n"
+                f"**Severity:** {inc['severity'] or 'N/A'}\n"
+                f"**Created:** {inc['created_at_utc'][:16]}\n"
+            )
+            if inc.get("resolved_at_utc"):
+                field_value += f"**Resolved:** {inc['resolved_at_utc'][:16]}\n"
+
+            embed.add_field(
+                name=f"📋 {inc['incident_id']}",
+                value=field_value,
+                inline=False,
+            )
+
+        search_params = []
+        if keyword:
+            search_params.append(f"keyword: {keyword}")
+        if incident_id:
+            search_params.append(f"ID: {incident_id}")
+        if severity:
+            search_params.append(f"severity: {severity}")
+        if date_from:
+            search_params.append(f"from: {date_from}")
+        if date_to:
+            search_params.append(f"to: {date_to}")
+
+        embed.set_footer(text=f"Search: {', '.join(search_params)}")
+
+        # Add view details button
+        view = IncidentSearchView(results)
+        await interaction.followup.send(embed=embed, view=view, ephemeral=True)
+
+    except Exception as e:
+        await interaction.followup.send(
+            f"Error searching incidents: {e}", ephemeral=True
+        )
+
+
 @client.event
 async def on_ready():
     await db_init()
@@ -925,7 +1533,14 @@ GPS_PAGE_HTML = """<!doctype html>
   const params = new URLSearchParams(window.location.search);
   const incident_id = params.get("incident_id");
   const token = params.get("token");
-  document.getElementById("incident").textContent = incident_id || "(missing)";
+
+  // Determine if this is incident-based or general location sharing
+  const isIncident = !!incident_id;
+  const endpoint = isIncident ? "/gps/report" : "/location-share/report";
+
+  if (isIncident) {
+    document.getElementById("incident").textContent = incident_id || "(missing)";
+  }
 
   const statusEl = document.getElementById("status");
   const btn = document.getElementById("btn");
@@ -936,8 +1551,12 @@ GPS_PAGE_HTML = """<!doctype html>
   }
 
   btn.addEventListener("click", async () => {
-    if (!incident_id || !token) {
-      setStatus("Missing incident_id or token.", "err");
+    if (!token) {
+      setStatus("Missing token.", "err");
+      return;
+    }
+    if (isIncident && !incident_id) {
+      setStatus("Missing incident_id.", "err");
       return;
     }
     if (!navigator.geolocation) {
@@ -949,7 +1568,6 @@ GPS_PAGE_HTML = """<!doctype html>
 
     navigator.geolocation.getCurrentPosition(async (pos) => {
       const payload = {
-        incident_id,
         token,
         label: document.getElementById("label").value || "",
         lat: pos.coords.latitude,
@@ -957,9 +1575,13 @@ GPS_PAGE_HTML = """<!doctype html>
         accuracy_m: pos.coords.accuracy || null
       };
 
+      if (isIncident) {
+        payload.incident_id = incident_id;
+      }
+
       try {
         setStatus("Sending location to MedBot…");
-        const res = await fetch("/gps/report", {
+        const res = await fetch(endpoint, {
           method: "POST",
           headers: { "Content-Type": "application/json" },
           body: JSON.stringify(payload)
@@ -1058,6 +1680,76 @@ async def gps_report(request: web.Request):
 # =========================
 
 
+async def location_share_page(request: web.Request):
+    """Serve GPS page for general location sharing (not tied to incident)."""
+    token = request.query.get("token", "")
+
+    # Validate token
+    token_data = await db_get_location_share_token(token)
+    if not token_data:
+        return web.Response(
+            text="<h1>Invalid or expired link</h1><p>This location share link is invalid or has expired.</p>",
+            content_type="text/html",
+            status=403,
+        )
+
+    # Use same GPS page but with different context
+    html = GPS_PAGE_HTML.replace(
+        '<p><b>Incident:</b> <code id="incident"></code></p>',
+        f'<p><b>Sharing location to channel</b></p><p class="muted">Requested by: <b>{token_data["user_name"]}</b></p>',
+    )
+    return web.Response(text=html, content_type="text/html")
+
+
+async def location_share_report(request: web.Request):
+    """Handle location report from general location sharing."""
+    data = await request.json()
+
+    token = clean(data.get("token"), 200)
+    label = clean(data.get("label"), 80)
+
+    try:
+        lat = float(data.get("lat"))
+        lon = float(data.get("lon"))
+    except Exception:
+        return web.json_response(
+            {"ok": False, "error": "Invalid lat or lon"}, status=400
+        )
+
+    accuracy_m = None
+    try:
+        if data.get("accuracy_m") is not None:
+            accuracy_m = float(data.get("accuracy_m"))
+    except Exception:
+        accuracy_m = None
+
+    # Validate token
+    token_data = await db_get_location_share_token(token)
+    if not token_data:
+        return web.json_response(
+            {"ok": False, "error": "Invalid or expired token"}, status=403
+        )
+
+    # Post to the specified channel
+    guilds = client.guilds
+    if not guilds:
+        return web.json_response({"ok": False, "error": "Bot not ready"}, status=503)
+
+    guild = guilds[0]
+    channel = guild.get_channel(int(token_data["channel_id"]))
+
+    if channel:
+        maps_link = f"https://maps.google.com/?q={lat},{lon}"
+        acc_txt = f"{accuracy_m:.0f} m" if isinstance(accuracy_m, float) else "unknown"
+        who = f" from **{label}**" if label else f" from **{token_data['user_name']}**"
+
+        await channel.send(
+            f"📍 GPS location shared{who}: {lat:.6f}, {lon:.6f} (accuracy {acc_txt}).\n{maps_link}"
+        )
+
+    return web.json_response({"ok": True})
+
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/health", health_check)
@@ -1066,6 +1758,9 @@ async def start_web_server():
 
     app.router.add_get("/gps", gps_page)
     app.router.add_post("/gps/report", gps_report)
+
+    app.router.add_get("/location-share", location_share_page)
+    app.router.add_post("/location-share/report", location_share_report)
 
     runner = web.AppRunner(app)
     await runner.setup()
