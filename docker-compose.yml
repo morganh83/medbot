@@ -35,4 +35,5 @@ services:
 
 networks:
   tunnelnet:
-    driver: bridge
+    external: true
+    name: tunnelnet
