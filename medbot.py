@@ -4,7 +4,7 @@ import datetime as dt
 import secrets
 from typing import Optional, Dict, Any, List
 
-from aiohttp import web
+from aiohttp import web, ClientSession
 import aiosqlite
 import discord
 from discord import app_commands
@@ -44,8 +44,8 @@ WEB_BIND_PORT = int(os.getenv("WEB_BIND_PORT", "8080"))
 # Your website must send header: X-MedBot-Secret: <secret>
 WEBHOOK_SHARED_SECRET = os.getenv("WEBHOOK_SHARED_SECRET", "CHANGE_ME")
 
-# LocationIQ API key for GPS location services (free tier available)
-LOCATIONIQ_API_KEY = os.getenv("LOCATIONIQ_API_KEY", "")
+# LocationIQ API key for reverse geocoding (free tier available)
+LOCATIONIQ_API_KEY = os.getenv("LOCIQ_API_KEY", "")
 
 # Discord role ID required to resolve incidents (optional - if not set, uses manage_messages permission)
 DISPATCH_ROLE_ID = int(os.getenv("DISPATCH_ROLE_ID", "0"))
@@ -530,6 +530,57 @@ async def db_get_incident_archive(db_id: int) -> Optional[Dict[str, Any]]:
         incident_dict["locations"] = [dict(r) for r in await cur.fetchall()]
 
         return incident_dict
+
+
+async def reverse_geocode(lat: float, lon: float) -> Optional[str]:
+    """
+    Use LocationIQ to convert GPS coordinates to a human-readable address.
+    Returns formatted address or None if geocoding fails.
+    """
+    if not LOCATIONIQ_API_KEY:
+        return None
+
+    try:
+        url = f"https://us1.locationiq.com/v1/reverse.php"
+        params = {
+            "key": LOCATIONIQ_API_KEY,
+            "lat": lat,
+            "lon": lon,
+            "format": "json",
+            "normalizeaddress": 1,
+        }
+
+        async with ClientSession() as session:
+            async with session.get(url, params=params, timeout=5) as response:
+                if response.status == 200:
+                    data = await response.json()
+                    # Format a concise address
+                    display_name = data.get("display_name", "")
+                    # Try to get just the useful parts
+                    address = data.get("address", {})
+                    parts = []
+
+                    # Add road/place
+                    if road := address.get("road"):
+                        parts.append(road)
+                    elif suburb := address.get("suburb"):
+                        parts.append(suburb)
+
+                    # Add city
+                    if city := address.get("city") or address.get("town") or address.get("village"):
+                        parts.append(city)
+
+                    # Add state if in US
+                    if state := address.get("state"):
+                        parts.append(state)
+
+                    return ", ".join(parts) if parts else display_name[:100]
+                else:
+                    print(f"Geocoding failed: HTTP {response.status}")
+                    return None
+    except Exception as e:
+        print(f"Geocoding error: {e}")
+        return None
 
 
 async def export_incidents_to_csv():
@@ -1450,11 +1501,16 @@ async def handle_join(request: web.Request):
 
     if not JOIN_INTAKE_CHANNEL_ID:
         return web.json_response(
-            {"ok": False, "error": "JOIN_INTAKE_CHANNEL_ID not configured"}, status=500
+            {"ok": False, "error": "JOIN_INTAKE_CHANNEL_ID not configured"},
+            status=500,
+            headers={"Access-Control-Allow-Origin": "*"}
         )
 
     await post_form_to_channel(JOIN_INTAKE_CHANNEL_ID, "New Join Request", fields)
-    return web.json_response({"ok": True})
+    return web.json_response(
+        {"ok": True},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 
 async def handle_book(request: web.Request):
@@ -1473,11 +1529,16 @@ async def handle_book(request: web.Request):
 
     if not BOOKINGS_CHANNEL_ID:
         return web.json_response(
-            {"ok": False, "error": "BOOKINGS_CHANNEL_ID not configured"}, status=500
+            {"ok": False, "error": "BOOKINGS_CHANNEL_ID not configured"},
+            status=500,
+            headers={"Access-Control-Allow-Origin": "*"}
         )
 
     await post_form_to_channel(BOOKINGS_CHANNEL_ID, "New Booking Request", fields)
-    return web.json_response({"ok": True})
+    return web.json_response(
+        {"ok": True},
+        headers={"Access-Control-Allow-Origin": "*"}
+    )
 
 
 # =========================
@@ -1668,8 +1729,13 @@ async def gps_report(request: web.Request):
         maps_link = f"https://maps.google.com/?q={lat},{lon}"
         acc_txt = f"{accuracy_m:.0f} m" if isinstance(accuracy_m, float) else "unknown"
         who = f" from **{label}**" if label else ""
+
+        # Try to get human-readable address via reverse geocoding
+        address = await reverse_geocode(lat, lon)
+        address_text = f"\n📍 **Address:** {address}" if address else ""
+
         await target.send(
-            f"GPS location received for **{incident_id}**{who}: {lat:.6f}, {lon:.6f} (accuracy {acc_txt}).\n{maps_link}"
+            f"GPS location received for **{incident_id}**{who}: {lat:.6f}, {lon:.6f} (accuracy {acc_txt}){address_text}\n{maps_link}"
         )
 
     return web.json_response({"ok": True})
@@ -1743,17 +1809,38 @@ async def location_share_report(request: web.Request):
         acc_txt = f"{accuracy_m:.0f} m" if isinstance(accuracy_m, float) else "unknown"
         who = f" from **{label}**" if label else f" from **{token_data['user_name']}**"
 
+        # Try to get human-readable address via reverse geocoding
+        address = await reverse_geocode(lat, lon)
+        address_text = f"\n📍 **Address:** {address}" if address else ""
+
         await channel.send(
-            f"📍 GPS location shared{who}: {lat:.6f}, {lon:.6f} (accuracy {acc_txt}).\n{maps_link}"
+            f"📍 GPS location shared{who}: {lat:.6f}, {lon:.6f} (accuracy {acc_txt}){address_text}\n{maps_link}"
         )
 
     return web.json_response({"ok": True})
 
 
+async def handle_cors_preflight(request: web.Request):
+    """Handle CORS preflight OPTIONS requests."""
+    return web.Response(
+        status=204,
+        headers={
+            "Access-Control-Allow-Origin": "*",
+            "Access-Control-Allow-Methods": "POST, OPTIONS",
+            "Access-Control-Allow-Headers": "Content-Type, X-MedBot-Secret",
+            "Access-Control-Max-Age": "86400",
+        }
+    )
+
+
 async def start_web_server():
     app = web.Application()
     app.router.add_get("/health", health_check)
+
+    # Webhook endpoints with CORS preflight
+    app.router.add_options("/webhook/join", handle_cors_preflight)
     app.router.add_post("/webhook/join", handle_join)
+    app.router.add_options("/webhook/book", handle_cors_preflight)
     app.router.add_post("/webhook/book", handle_book)
 
     app.router.add_get("/gps", gps_page)
