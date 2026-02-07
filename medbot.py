@@ -10,6 +10,13 @@ import discord
 from discord import app_commands
 
 try:
+    import openlocationcode as olc
+    HAS_PLUS_CODES = True
+except ImportError:
+    HAS_PLUS_CODES = False
+    print("Warning: openlocationcode not installed. Plus Codes will not be available.")
+
+try:
     from dotenv import load_dotenv
 
     load_dotenv()
@@ -157,6 +164,22 @@ async def db_init():
 
 def utc_now_iso() -> str:
     return dt.datetime.utcnow().replace(microsecond=0).isoformat() + "Z"
+
+
+def generate_plus_code(lat: float, lon: float) -> Optional[str]:
+    """
+    Generate a Plus Code (Open Location Code) for precise location.
+    11-character code provides ~3m x 3m precision.
+    """
+    if not HAS_PLUS_CODES:
+        return None
+    try:
+        # Generate full code with maximum precision (11 chars = ~3m)
+        code = olc.encode(lat, lon, codeLength=11)
+        return code
+    except Exception as e:
+        print(f"Plus Code generation error: {e}")
+        return None
 
 
 def local_now_for_id() -> dt.datetime:
@@ -1446,6 +1469,34 @@ async def on_ready():
         await tree.sync()
     except Exception as e:
         print("Command sync failed:", e)
+
+    # Re-register views for all open incidents so buttons work after restart
+    try:
+        async with aiosqlite.connect(DB_PATH) as db:
+            db.row_factory = aiosqlite.Row
+            cur = await db.execute(
+                """
+                SELECT i.id, i.incident_id, t.gps_token
+                FROM incidents i
+                LEFT JOIN incident_tokens t ON t.incident_db_id = i.id
+                WHERE i.status IN ('open', 'escalated')
+                """
+            )
+            open_incidents = await cur.fetchall()
+
+            for inc in open_incidents:
+                gps_url = f"{PUBLIC_BASE_URL}/gps?incident_id={inc['incident_id']}&token={inc['gps_token']}" if inc['gps_token'] else ""
+                view = DispatchView(
+                    db_id=inc['id'],
+                    incident_id=inc['incident_id'],
+                    gps_url=gps_url
+                )
+                client.add_view(view)
+
+        print(f"Re-registered {len(open_incidents)} incident views")
+    except Exception as e:
+        print(f"Warning: Could not re-register views: {e}")
+
     print(f"MedBot logged in as {client.user}.")
 
 
@@ -1727,15 +1778,19 @@ async def gps_report(request: web.Request):
 
     if target:
         maps_link = f"https://maps.google.com/?q={lat},{lon}"
-        acc_txt = f"{accuracy_m:.0f} m" if isinstance(accuracy_m, float) else "unknown"
         who = f" from **{label}**" if label else ""
 
-        # Try to get human-readable address via reverse geocoding
-        address = await reverse_geocode(lat, lon)
-        address_text = f"\n📍 **Address:** {address}" if address else ""
+        # Generate Plus Code for precise location (3m accuracy)
+        plus_code = generate_plus_code(lat, lon)
+        plus_code_text = f"\n📍 **Plus Code:** `{plus_code}`" if plus_code else ""
+
+        # Format accuracy
+        acc_txt = f"±{accuracy_m:.0f}m" if isinstance(accuracy_m, float) else "unknown"
 
         await target.send(
-            f"GPS location received for **{incident_id}**{who}: {lat:.6f}, {lon:.6f} (accuracy {acc_txt}){address_text}\n{maps_link}"
+            f"📍 **GPS Location** for **{incident_id}**{who}\n"
+            f"**Coordinates:** `{lat:.6f}, {lon:.6f}` ({acc_txt}){plus_code_text}\n"
+            f"[Open in Google Maps]({maps_link})"
         )
 
     return web.json_response({"ok": True})
@@ -1806,15 +1861,19 @@ async def location_share_report(request: web.Request):
 
     if channel:
         maps_link = f"https://maps.google.com/?q={lat},{lon}"
-        acc_txt = f"{accuracy_m:.0f} m" if isinstance(accuracy_m, float) else "unknown"
         who = f" from **{label}**" if label else f" from **{token_data['user_name']}**"
 
-        # Try to get human-readable address via reverse geocoding
-        address = await reverse_geocode(lat, lon)
-        address_text = f"\n📍 **Address:** {address}" if address else ""
+        # Generate Plus Code for precise location (3m accuracy)
+        plus_code = generate_plus_code(lat, lon)
+        plus_code_text = f"\n📍 **Plus Code:** `{plus_code}`" if plus_code else ""
+
+        # Format accuracy
+        acc_txt = f"±{accuracy_m:.0f}m" if isinstance(accuracy_m, float) else "unknown"
 
         await channel.send(
-            f"📍 GPS location shared{who}: {lat:.6f}, {lon:.6f} (accuracy {acc_txt}){address_text}\n{maps_link}"
+            f"📍 **GPS Location**{who}\n"
+            f"**Coordinates:** `{lat:.6f}, {lon:.6f}` ({acc_txt}){plus_code_text}\n"
+            f"[Open in Google Maps]({maps_link})"
         )
 
     return web.json_response({"ok": True})
