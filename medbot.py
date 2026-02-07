@@ -1476,10 +1476,10 @@ async def on_ready():
             db.row_factory = aiosqlite.Row
             cur = await db.execute(
                 """
-                SELECT i.id, i.incident_id, t.gps_token
+                SELECT i.id, i.incident_id, i.discord_message_id, t.gps_token
                 FROM incidents i
                 LEFT JOIN incident_tokens t ON t.incident_db_id = i.id
-                WHERE i.status IN ('open', 'escalated')
+                WHERE i.status IN ('open', 'escalated') AND i.discord_message_id IS NOT NULL
                 """
             )
             open_incidents = await cur.fetchall()
@@ -1491,7 +1491,8 @@ async def on_ready():
                     incident_id=inc['incident_id'],
                     gps_url=gps_url
                 )
-                client.add_view(view)
+                # Attach view to the specific message ID so Discord knows which buttons it handles
+                client.add_view(view, message_id=inc['discord_message_id'])
 
         print(f"Re-registered {len(open_incidents)} incident views")
     except Exception as e:
