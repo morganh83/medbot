@@ -1,3 +1,4 @@
+import json
 import os
 import asyncio
 import datetime as dt
@@ -61,6 +62,45 @@ DB_PATH = os.getenv("DB_PATH", "medbot.db")
 
 EXPORT_CSV = os.getenv("EXPORT_CSV", "true").lower() == "true"
 CSV_EXPORT_PATH = os.getenv("CSV_EXPORT_PATH", "incidents_export.csv")
+
+SHEETDB_API_URL = os.getenv("SHEETDB_API_URL", "").rstrip("/")
+ROLES_CONFIG_PATH = os.getenv("ROLES_CONFIG_PATH", "roles_config.json")
+
+# Optional: set to a guild ID for instant command sync during development
+# Leave empty/0 for global sync (production — can take up to 1 hour)
+DEV_GUILD_ID = int(os.getenv("DEV_GUILD_ID", "0"))
+
+APPROVAL_CHANNEL_ID = int(os.getenv("APPROVAL_CHANNEL_ID", "0"))
+
+# Module-level role config (populated by load_roles_config)
+ROLES: List[Dict[str, Any]] = []
+CERTIFICATIONS: List[Dict[str, Any]] = []
+ALL_ITEMS: List[Dict[str, Any]] = []
+VERIFIED_ROLE_ID: int = 0
+UNVERIFIED_ROLE_ID: int = 0
+PENDING_APPROVAL_ROLE_ID: int = 0
+
+
+def load_roles_config():
+    """Load and validate roles from the JSON config file."""
+    global ROLES, CERTIFICATIONS, ALL_ITEMS, VERIFIED_ROLE_ID, UNVERIFIED_ROLE_ID, PENDING_APPROVAL_ROLE_ID
+
+    with open(ROLES_CONFIG_PATH, "r", encoding="utf-8") as f:
+        cfg = json.load(f)
+
+    ROLES = [r for r in cfg.get("roles", []) if r.get("discord_role_id", 0) != 0]
+    CERTIFICATIONS = [r for r in cfg.get("certifications", []) if r.get("discord_role_id", 0) != 0]
+    ALL_ITEMS = ROLES + CERTIFICATIONS
+    VERIFIED_ROLE_ID = cfg.get("verified_role_id", 0)
+    UNVERIFIED_ROLE_ID = cfg.get("unverified_role_id", 0)
+    PENDING_APPROVAL_ROLE_ID = cfg.get("pending_approval_role_id", 0)
+
+    verify_count = sum(1 for r in ROLES if r.get("requires_verification"))
+    approval_count = sum(1 for r in ROLES if r.get("requires_approval"))
+    print(f"Roles config loaded: {len(ROLES)} roles ({verify_count} require verification, {approval_count} require approval), {len(CERTIFICATIONS)} certifications")
+    if not ALL_ITEMS:
+        print("Warning: No roles/certifications with non-zero discord_role_id found in config. "
+              "Set discord_role_id values in roles_config.json.")
 
 
 # =========================
@@ -152,6 +192,40 @@ CREATE TABLE IF NOT EXISTS location_share_tokens (
     user_name TEXT NOT NULL,
     created_at_utc TEXT NOT NULL,
     expires_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS member_profiles (
+    user_id INTEGER PRIMARY KEY,
+    first_name TEXT NOT NULL,
+    last_name TEXT NOT NULL,
+    nickname_set TEXT NOT NULL,
+    joined_at_utc TEXT NOT NULL,
+    updated_at_utc TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS member_roles (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    role_key TEXT NOT NULL,
+    role_type TEXT NOT NULL,
+    discord_role_id INTEGER NOT NULL,
+    cert_number TEXT,
+    assigned_at_utc TEXT NOT NULL,
+    verified_at_utc TEXT,
+    sheetdb_synced INTEGER DEFAULT 0,
+    UNIQUE(user_id, role_key)
+);
+
+CREATE TABLE IF NOT EXISTS pending_approvals (
+    id INTEGER PRIMARY KEY AUTOINCREMENT,
+    user_id INTEGER NOT NULL,
+    role_key TEXT NOT NULL,
+    discord_message_id INTEGER,
+    requested_at_utc TEXT NOT NULL,
+    status TEXT NOT NULL DEFAULT 'pending',
+    reviewed_by_user_id INTEGER,
+    reviewed_at_utc TEXT,
+    UNIQUE(user_id, role_key)
 );
 """
 
@@ -460,6 +534,172 @@ async def db_archive_files(db_id: int, files: List[Dict[str, Any]]):
         await db.commit()
 
 
+# ----- Member profile / role DB helpers -----
+
+
+async def db_upsert_member_profile(user_id: int, first_name: str, last_name: str, nickname: str):
+    now = utc_now_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO member_profiles (user_id, first_name, last_name, nickname_set, joined_at_utc, updated_at_utc)
+            VALUES (?, ?, ?, ?, ?, ?)
+            ON CONFLICT(user_id) DO UPDATE SET
+                first_name = excluded.first_name,
+                last_name = excluded.last_name,
+                nickname_set = excluded.nickname_set,
+                updated_at_utc = excluded.updated_at_utc
+            """,
+            (user_id, first_name, last_name, nickname, now, now),
+        )
+        await db.commit()
+
+
+async def db_get_member_profile(user_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM member_profiles WHERE user_id = ?", (user_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def db_insert_member_role(user_id: int, role_key: str, role_type: str, discord_role_id: int):
+    now = utc_now_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            INSERT INTO member_roles (user_id, role_key, role_type, discord_role_id, assigned_at_utc)
+            VALUES (?, ?, ?, ?, ?)
+            ON CONFLICT(user_id, role_key) DO UPDATE SET
+                role_type = excluded.role_type,
+                discord_role_id = excluded.discord_role_id
+            """,
+            (user_id, role_key, role_type, discord_role_id, now),
+        )
+        await db.commit()
+
+
+async def db_get_member_roles(user_id: int) -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM member_roles WHERE user_id = ?", (user_id,))
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_get_pending_certs(user_id: int) -> List[Dict[str, Any]]:
+    """Get certification rows that still need a cert number submitted."""
+    cert_keys = {c["key"] for c in CERTIFICATIONS}
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM member_roles WHERE user_id = ? AND cert_number IS NULL",
+            (user_id,),
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows if r["role_key"] in cert_keys]
+
+
+async def db_submit_cert_number(user_id: int, role_key: str, cert_number: str):
+    now = utc_now_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            """
+            UPDATE member_roles
+            SET cert_number = ?, verified_at_utc = ?, sheetdb_synced = 0
+            WHERE user_id = ? AND role_key = ?
+            """,
+            (cert_number, now, user_id, role_key),
+        )
+        await db.commit()
+
+
+async def db_has_role(user_id: int, role_key: str) -> bool:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT 1 FROM member_roles WHERE user_id = ? AND role_key = ?",
+            (user_id, role_key),
+        )
+        return await cur.fetchone() is not None
+
+
+# ----- Pending approval DB helpers -----
+
+
+async def db_create_pending_approval(user_id: int, role_key: str) -> int:
+    now = utc_now_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            """
+            INSERT INTO pending_approvals (user_id, role_key, requested_at_utc, status)
+            VALUES (?, ?, ?, 'pending')
+            ON CONFLICT(user_id, role_key) DO UPDATE SET
+                status = 'pending',
+                requested_at_utc = excluded.requested_at_utc,
+                reviewed_by_user_id = NULL,
+                reviewed_at_utc = NULL
+            """,
+            (user_id, role_key, now),
+        )
+        await db.commit()
+        return cur.lastrowid
+
+
+async def db_set_approval_message(approval_id: int, message_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE pending_approvals SET discord_message_id = ? WHERE id = ?",
+            (message_id, approval_id),
+        )
+        await db.commit()
+
+
+async def db_resolve_approval(approval_id: int, status: str, reviewer_id: int):
+    now = utc_now_iso()
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE pending_approvals SET status = ?, reviewed_by_user_id = ?, reviewed_at_utc = ? WHERE id = ?",
+            (status, reviewer_id, now, approval_id),
+        )
+        await db.commit()
+
+
+async def db_get_pending_approval(approval_id: int) -> Optional[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute("SELECT * FROM pending_approvals WHERE id = ?", (approval_id,))
+        row = await cur.fetchone()
+        return dict(row) if row else None
+
+
+async def db_count_pending_approvals(user_id: int) -> int:
+    async with aiosqlite.connect(DB_PATH) as db:
+        cur = await db.execute(
+            "SELECT COUNT(*) FROM pending_approvals WHERE user_id = ? AND status = 'pending'",
+            (user_id,),
+        )
+        row = await cur.fetchone()
+        return row[0] if row else 0
+
+
+async def db_get_all_pending_approvals() -> List[Dict[str, Any]]:
+    async with aiosqlite.connect(DB_PATH) as db:
+        db.row_factory = aiosqlite.Row
+        cur = await db.execute(
+            "SELECT * FROM pending_approvals WHERE status = 'pending' AND discord_message_id IS NOT NULL"
+        )
+        rows = await cur.fetchall()
+        return [dict(r) for r in rows]
+
+
+async def db_mark_sheetdb_synced(role_id: int):
+    async with aiosqlite.connect(DB_PATH) as db:
+        await db.execute(
+            "UPDATE member_roles SET sheetdb_synced = 1 WHERE id = ?", (role_id,)
+        )
+        await db.commit()
+
+
 async def db_search_incidents(
     keyword: Optional[str] = None,
     date_from: Optional[str] = None,
@@ -657,6 +897,92 @@ async def export_incidents_to_csv():
 
 
 # =========================
+# SheetDB sync
+# =========================
+
+
+async def sync_member_to_sheetdb(
+    user_id: int,
+    first_name: str,
+    last_name: str,
+    join_date: str,
+    certs_str: str,
+    roles_str: str,
+    status: str,
+):
+    """Sync member data to SheetDB. Failures are silent (local DB is source of truth)."""
+    if not SHEETDB_API_URL:
+        return
+
+    row = {
+        "Discord User ID": str(user_id),
+        "First Name": first_name,
+        "Last Name": last_name,
+        "Join Date": join_date,
+        "Certifications": certs_str,
+        "Roles": roles_str,
+        "Status": status,
+    }
+
+    try:
+        async with ClientSession() as session:
+            # Check if row already exists
+            search_url = f"{SHEETDB_API_URL}/search?Discord User ID={user_id}"
+            async with session.get(search_url, timeout=10) as resp:
+                existing = await resp.json()
+
+            if existing:
+                # Update existing row
+                patch_url = f"{SHEETDB_API_URL}/Discord User ID/{user_id}"
+                async with session.patch(patch_url, json={"data": row}, timeout=10) as resp:
+                    await resp.read()
+            else:
+                # Create new row
+                async with session.post(SHEETDB_API_URL, json={"data": [row]}, timeout=10) as resp:
+                    await resp.read()
+
+            # Mark all roles as synced
+            member_roles = await db_get_member_roles(user_id)
+            for mr in member_roles:
+                await db_mark_sheetdb_synced(mr["id"])
+
+    except Exception as e:
+        print(f"SheetDB sync error for user {user_id}: {e}")
+
+
+def _get_verifiable_config(role_key: str) -> Optional[Dict[str, Any]]:
+    """Look up a certification definition from config by key."""
+    for r in CERTIFICATIONS:
+        if r["key"] == role_key:
+            return r
+    return None
+
+
+def _build_roles_string(member_roles: List[Dict[str, Any]]) -> str:
+    """Build comma-separated role labels for SheetDB Roles column."""
+    role_keys = {r["key"] for r in ROLES}
+    labels = []
+    for mr in member_roles:
+        if mr["role_key"] in role_keys:
+            cfg = next((r for r in ROLES if r["key"] == mr["role_key"]), None)
+            labels.append(cfg["label"] if cfg else mr["role_key"])
+    return ", ".join(labels)
+
+
+def _build_certs_string(member_roles: List[Dict[str, Any]]) -> str:
+    """Build cert labels with numbers for SheetDB Certifications column."""
+    cert_keys = {c["key"] for c in CERTIFICATIONS}
+    parts = []
+    for mr in member_roles:
+        if mr["role_key"] in cert_keys:
+            cfg = next((c for c in CERTIFICATIONS if c["key"] == mr["role_key"]), None)
+            label = cfg["label"] if cfg else mr["role_key"]
+            number = mr.get("cert_number") or "pending"
+            parts.append(f"{label}: {number}")
+    return ", ".join(parts)
+
+
+# =========================
 # Discord formatting helpers
 # =========================
 
@@ -692,12 +1018,20 @@ def build_dispatch_embed(
     reported_injury: str,
     notes: str,
     gps_url: str,
+    is_training: bool = False,
 ) -> discord.Embed:
-    embed = discord.Embed(
-        title="Dispatch Alert",
-        description="New incident reported. Responders, please claim or join below.",
-        color=discord.Color.red(),
-    )
+    if is_training:
+        embed = discord.Embed(
+            title="[TRAINING] Dispatch Alert",
+            description="This is a training exercise. Responders, practice claiming and joining below.",
+            color=discord.Color.blue(),
+        )
+    else:
+        embed = discord.Embed(
+            title="Dispatch Alert",
+            description="New incident reported. Responders, please claim or join below.",
+            color=discord.Color.red(),
+        )
     embed.add_field(name="Incident ID", value=incident_id, inline=True)
     embed.add_field(name="Status", value="open", inline=True)
     embed.add_field(name="Reported by", value=reporter, inline=True)
@@ -941,15 +1275,28 @@ class CareNotesModal(discord.ui.Modal, title="Incident Care Summary"):
 
 
 class DispatchView(discord.ui.View):
-    def __init__(self, db_id: int, incident_id: str, gps_url: str):
+    def __init__(self, db_id: int, incident_id: str, gps_url: str, is_training: bool = False):
         super().__init__(timeout=None)
         self.db_id = db_id
         self.incident_id = incident_id
         self.gps_url = gps_url
+        self.is_training = is_training
+        # In-memory responder tracking for training mode (no DB)
+        self._training_responders: List[Dict[str, Any]] = []
+        # For training cleanup: store the channel message ID so resolve works from the thread too
+        self._channel_message_id: Optional[int] = None
 
     async def get_update_target(
         self, interaction: discord.Interaction
     ) -> discord.abc.Messageable:
+        if self.is_training:
+            # For training, find the thread created from the channel message
+            if self._channel_message_id:
+                thread = interaction.guild.get_thread(self._channel_message_id)
+                if thread:
+                    return thread
+            return interaction.channel
+
         # Prefer incident thread if it exists.
         try:
             incident = await db_get_incident_by_incident_id(self.incident_id)
@@ -963,10 +1310,30 @@ class DispatchView(discord.ui.View):
             pass
         return interaction.channel
 
+    async def _get_responders(self) -> List[Dict[str, Any]]:
+        if self.is_training:
+            return self._training_responders
+        return await db_get_responders(self.db_id)
+
+    async def _upsert_responder(self, user_id: int, user_name: str, role: str, status: str):
+        if self.is_training:
+            existing = next((r for r in self._training_responders if r["user_id"] == user_id), None)
+            if existing:
+                existing["role"] = role
+                existing["status"] = status
+                existing["user_name"] = user_name
+            else:
+                self._training_responders.append({
+                    "user_id": user_id, "user_name": user_name,
+                    "role": role, "status": status, "updated_at_utc": utc_now_iso(),
+                })
+        else:
+            await db_upsert_responder(self.db_id, user_id, user_name, role, status)
+
     async def refresh_embed(
         self, interaction: discord.Interaction, note: Optional[str] = None
     ):
-        responders = await db_get_responders(self.db_id)
+        responders = await self._get_responders()
 
         embed = (
             interaction.message.embeds[0]
@@ -989,7 +1356,7 @@ class DispatchView(discord.ui.View):
     async def ensure_responder_role(
         self, user: discord.Member, preferred_role: str
     ) -> str:
-        responders = await db_get_responders(self.db_id)
+        responders = await self._get_responders()
         existing = next((r for r in responders if int(r["user_id"]) == user.id), None)
         if existing:
             return existing["role"]
@@ -1005,7 +1372,7 @@ class DispatchView(discord.ui.View):
     async def claim_primary(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        responders = await db_get_responders(self.db_id)
+        responders = await self._get_responders()
         primary_exists = any(r["role"] == "primary" for r in responders)
 
         if primary_exists:
@@ -1015,8 +1382,7 @@ class DispatchView(discord.ui.View):
             )
             return
 
-        await db_upsert_responder(
-            self.db_id,
+        await self._upsert_responder(
             interaction.user.id,
             interaction.user.display_name,
             "primary",
@@ -1045,8 +1411,7 @@ class DispatchView(discord.ui.View):
     async def join_additional(
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
-        await db_upsert_responder(
-            self.db_id,
+        await self._upsert_responder(
             interaction.user.id,
             interaction.user.display_name,
             "additional",
@@ -1078,8 +1443,7 @@ class DispatchView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         role = await self.ensure_responder_role(interaction.user, "additional")
-        await db_upsert_responder(
-            self.db_id,
+        await self._upsert_responder(
             interaction.user.id,
             interaction.user.display_name,
             role,
@@ -1148,7 +1512,8 @@ class DispatchView(discord.ui.View):
         self, interaction: discord.Interaction, button: discord.ui.Button
     ):
         """Escalating button - indicates advanced medical care needed."""
-        await db_set_status(self.db_id, "escalated")
+        if not self.is_training:
+            await db_set_status(self.db_id, "escalated")
 
         await interaction.response.send_message(
             f"Incident **{self.incident_id}** marked as escalating (advanced care needed).",
@@ -1191,9 +1556,608 @@ class DispatchView(discord.ui.View):
             )
             return
 
+        if self.is_training:
+            await interaction.response.defer(ephemeral=True)
+            guild = interaction.guild
+            channel_msg_id = self._channel_message_id
+
+            # Delete the thread (created from the channel message)
+            if channel_msg_id:
+                try:
+                    thread = guild.get_thread(channel_msg_id)
+                    if thread:
+                        await thread.delete()
+                except Exception as e:
+                    print(f"Warning: Could not delete training thread: {e}")
+
+            # Delete the channel dispatch message
+            if channel_msg_id:
+                try:
+                    ch = guild.get_channel(DISPATCH_CHANNEL_ID)
+                    if ch:
+                        ch_msg = await ch.fetch_message(channel_msg_id)
+                        await ch_msg.delete()
+                except Exception as e:
+                    print(f"Warning: Could not delete training channel message: {e}")
+
+            await interaction.followup.send(
+                "Training exercise resolved and cleaned up.", ephemeral=True
+            )
+            return
+
         # Show modal for care notes
         modal = CareNotesModal(self.db_id, self.incident_id, self)
         await interaction.response.send_modal(modal)
+
+
+# =========================
+# Onboarding / Certification UI
+# =========================
+
+# In-memory store: user_id -> {"roles": [...], "certifications": [...]} (cleared on submit)
+_onboarding_selections: Dict[int, Dict[str, List[str]]] = {}
+
+
+class RoleApprovalView(discord.ui.View):
+    """Persistent view with Approve/Deny buttons for role approval requests."""
+
+    def __init__(self, user_id: int, role_key: str, approval_id: int):
+        super().__init__(timeout=None)
+        self.target_user_id = user_id
+        self.role_key = role_key
+        self.approval_id = approval_id
+
+        approve_btn = discord.ui.Button(
+            label="Approve",
+            style=discord.ButtonStyle.success,
+            custom_id=f"approval_approve_{approval_id}",
+        )
+        approve_btn.callback = self.approve_callback
+        self.add_item(approve_btn)
+
+        deny_btn = discord.ui.Button(
+            label="Deny",
+            style=discord.ButtonStyle.danger,
+            custom_id=f"approval_deny_{approval_id}",
+        )
+        deny_btn.callback = self.deny_callback
+        self.add_item(deny_btn)
+
+    async def approve_callback(self, interaction: discord.Interaction):
+        # Check admin permission
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "You need Manage Roles permission to approve.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        member = guild.get_member(self.target_user_id)
+        if not member:
+            await interaction.followup.send("Member not found in server.", ephemeral=True)
+            return
+
+        # Find the role config
+        role_cfg = next((r for r in ROLES if r["key"] == self.role_key), None)
+        if not role_cfg:
+            await interaction.followup.send("Role config not found.", ephemeral=True)
+            return
+
+        # Assign the requested Discord role
+        role_obj = guild.get_role(role_cfg["discord_role_id"])
+        if role_obj:
+            try:
+                await member.add_roles(role_obj, reason=f"Approved by {interaction.user.display_name}")
+            except discord.Forbidden:
+                await interaction.followup.send(
+                    f"Cannot assign role — bot role too low in hierarchy.", ephemeral=True
+                )
+                return
+
+        # Save role to DB
+        await db_insert_member_role(member.id, self.role_key, "role", role_cfg["discord_role_id"])
+
+        # Update approval status
+        await db_resolve_approval(self.approval_id, "approved", interaction.user.id)
+
+        # Remove pending approval tag if no other pending approvals
+        remaining = await db_count_pending_approvals(self.target_user_id)
+        if remaining == 0 and PENDING_APPROVAL_ROLE_ID:
+            pending_role = guild.get_role(PENDING_APPROVAL_ROLE_ID)
+            if pending_role:
+                try:
+                    await member.remove_roles(pending_role, reason="All approvals resolved")
+                except discord.Forbidden:
+                    pass
+
+        # Disable buttons and update embed
+        for child in self.children:
+            child.disabled = True
+        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        embed.color = discord.Color.green()
+        embed.set_footer(text=f"Approved by {interaction.user.display_name}")
+        await interaction.message.edit(embed=embed, view=self)
+
+        # Notify member
+        try:
+            await member.send(
+                f"Your request for **{role_cfg['label']}** has been **approved**!"
+            )
+        except discord.Forbidden:
+            pass
+
+        await interaction.followup.send(
+            f"Approved **{role_cfg['label']}** for {member.display_name}.", ephemeral=True
+        )
+
+    async def deny_callback(self, interaction: discord.Interaction):
+        if not interaction.user.guild_permissions.manage_roles:
+            await interaction.response.send_message(
+                "You need Manage Roles permission to deny.", ephemeral=True
+            )
+            return
+
+        await interaction.response.defer(ephemeral=True)
+
+        guild = interaction.guild
+        member = guild.get_member(self.target_user_id)
+
+        # Update approval status
+        await db_resolve_approval(self.approval_id, "denied", interaction.user.id)
+
+        # Remove pending approval tag if no other pending approvals
+        if member:
+            remaining = await db_count_pending_approvals(self.target_user_id)
+            if remaining == 0 and PENDING_APPROVAL_ROLE_ID:
+                pending_role = guild.get_role(PENDING_APPROVAL_ROLE_ID)
+                if pending_role:
+                    try:
+                        await member.remove_roles(pending_role, reason="All approvals resolved")
+                    except discord.Forbidden:
+                        pass
+
+        # Disable buttons and update embed
+        for child in self.children:
+            child.disabled = True
+        embed = interaction.message.embeds[0] if interaction.message.embeds else discord.Embed()
+        embed.color = discord.Color.red()
+        embed.set_footer(text=f"Denied by {interaction.user.display_name}")
+        await interaction.message.edit(embed=embed, view=self)
+
+        # Notify member
+        role_cfg = next((r for r in ROLES if r["key"] == self.role_key), None)
+        label = role_cfg["label"] if role_cfg else self.role_key
+        if member:
+            try:
+                await member.send(
+                    f"Your request for **{label}** has been **denied**."
+                )
+            except discord.Forbidden:
+                pass
+
+        await interaction.followup.send(
+            f"Denied **{label}** for user ID {self.target_user_id}.", ephemeral=True
+        )
+
+
+async def _request_role_approval(
+    interaction: discord.Interaction,
+    member: discord.Member,
+    role_cfg: Dict[str, Any],
+    first_name: str,
+    last_name: str,
+):
+    """Create a pending approval and post to the approval channel."""
+    guild = interaction.guild
+
+    # Assign pending approval tag role
+    if PENDING_APPROVAL_ROLE_ID:
+        pending_role = guild.get_role(PENDING_APPROVAL_ROLE_ID)
+        if pending_role:
+            try:
+                await member.add_roles(pending_role, reason="Pending role approval")
+            except discord.Forbidden:
+                pass
+
+    # Create DB record
+    approval_id = await db_create_pending_approval(member.id, role_cfg["key"])
+
+    # Post to approval channel
+    approval_channel = guild.get_channel(APPROVAL_CHANNEL_ID)
+    if not approval_channel:
+        try:
+            approval_channel = await client.fetch_channel(APPROVAL_CHANNEL_ID)
+        except Exception:
+            pass
+    if not approval_channel:
+        print(f"WARNING: Approval channel {APPROVAL_CHANNEL_ID} not found")
+        return
+
+    embed = discord.Embed(
+        title="Role Approval Request",
+        description=f"**{first_name} {last_name}** ({member.mention}) requested the **{role_cfg['label']}** role.",
+        color=discord.Color.gold(),
+    )
+    embed.add_field(name="User", value=f"{member.display_name} ({member.id})", inline=True)
+    embed.add_field(name="Role", value=role_cfg["label"], inline=True)
+    embed.add_field(name="Requested", value=utc_now_iso()[:16], inline=True)
+
+    view = RoleApprovalView(user_id=member.id, role_key=role_cfg["key"], approval_id=approval_id)
+    msg = await approval_channel.send(embed=embed, view=view)
+    await db_set_approval_message(approval_id, msg.id)
+
+
+async def process_onboarding(
+    interaction: discord.Interaction,
+    first_name: str,
+    last_name: str,
+    selected_role_keys: List[str],
+    selected_cert_keys: List[str],
+):
+    """Shared onboarding logic: assign roles, save profile, sync SheetDB."""
+    fname = first_name.strip()
+    lname = last_name.strip()
+    last_initial = lname[0].upper() if lname else ""
+    nickname = f"{fname} {last_initial}."[:32]
+
+    member = interaction.user
+    guild = interaction.guild
+
+    # Set nickname (may fail if target is server owner)
+    try:
+        await member.edit(nick=nickname)
+    except discord.Forbidden:
+        pass
+
+    # Save / update profile
+    await db_upsert_member_profile(member.id, fname, lname, nickname)
+
+    # Resolve selected roles and certifications from config
+    selected_roles = [r for r in ROLES if r["key"] in selected_role_keys]
+    selected_certs = [c for c in CERTIFICATIONS if c["key"] in selected_cert_keys]
+
+    # Assign Discord roles and save to DB
+    assigned_labels = []
+    failed_labels = []
+    pending_approval_labels = []
+
+    for r in selected_roles:
+        # Check if this role requires admin approval
+        if r.get("requires_approval") and APPROVAL_CHANNEL_ID:
+            try:
+                await _request_role_approval(interaction, member, r, fname, lname)
+                pending_approval_labels.append(r["label"])
+                continue
+            except Exception as e:
+                print(f"WARNING: Role approval request failed for '{r['label']}', falling back to direct assign: {e}")
+                # Fall through to normal assignment below
+
+        role_obj = guild.get_role(r["discord_role_id"])
+        if role_obj:
+            try:
+                await member.add_roles(role_obj, reason="Onboarding role claim")
+            except discord.Forbidden:
+                print(f"WARNING: Cannot assign role '{r['label']}' to {member} — bot role too low in hierarchy?")
+                failed_labels.append(r["label"])
+        else:
+            print(f"WARNING: Role ID {r['discord_role_id']} for '{r['label']}' not found in guild")
+            failed_labels.append(r["label"])
+        await db_insert_member_role(member.id, r["key"], "role", r["discord_role_id"])
+        assigned_labels.append(r["label"])
+
+    for c in selected_certs:
+        role_obj = guild.get_role(c["discord_role_id"])
+        if role_obj:
+            try:
+                await member.add_roles(role_obj, reason="Onboarding certification claim")
+            except discord.Forbidden:
+                print(f"WARNING: Cannot assign cert role '{c['label']}' to {member} — bot role too low in hierarchy?")
+                failed_labels.append(c["label"])
+        else:
+            print(f"WARNING: Role ID {c['discord_role_id']} for '{c['label']}' not found in guild")
+            failed_labels.append(c["label"])
+        await db_insert_member_role(member.id, c["key"], "certification", c["discord_role_id"])
+        assigned_labels.append(c["label"])
+
+    # Handle verification status
+    needs_verification = (
+        any(r.get("requires_verification") for r in selected_roles)
+        or len(selected_certs) > 0
+    )
+    already_verified = VERIFIED_ROLE_ID and any(r.id == VERIFIED_ROLE_ID for r in member.roles)
+    if needs_verification and not already_verified and UNVERIFIED_ROLE_ID:
+        unverified_role = guild.get_role(UNVERIFIED_ROLE_ID)
+        if unverified_role:
+            try:
+                await member.add_roles(unverified_role, reason="Pending verification")
+            except discord.Forbidden:
+                pass
+
+    # Sync to SheetDB
+    all_member_roles = await db_get_member_roles(member.id)
+    roles_str = _build_roles_string(all_member_roles)
+    certs_str = _build_certs_string(all_member_roles)
+    pending = await db_get_pending_certs(member.id)
+    status = "Unverified" if (pending or (needs_verification and not already_verified)) else "Verified"
+    profile = await db_get_member_profile(member.id)
+    join_date = profile["joined_at_utc"][:10] if profile else utc_now_iso()[:10]
+
+    await sync_member_to_sheetdb(
+        member.id, fname, lname, join_date, certs_str, roles_str, status
+    )
+
+    # Build response
+    lines = [f"**Welcome, {nickname}!** Your roles have been assigned:"]
+    if assigned_labels:
+        lines.append(", ".join(f"**{l}**" for l in assigned_labels))
+    if pending_approval_labels:
+        lines.append(
+            f"\nPending admin approval: {', '.join(f'**{l}**' for l in pending_approval_labels)}"
+        )
+    if failed_labels:
+        lines.append(
+            f"\n**Warning:** Could not assign: {', '.join(failed_labels)}. "
+            "An admin needs to move the bot's role higher in the server role hierarchy."
+        )
+    if needs_verification:
+        lines.append(
+            "\nYou have roles/certifications that require verification. "
+            "Use `/submit-certs` to submit your certification numbers and get verified."
+        )
+    await interaction.followup.send("\n".join(lines), ephemeral=True)
+
+
+class OnboardingModal(discord.ui.Modal, title="Welcome — Tell Us Your Name"):
+    first_name = discord.ui.TextInput(
+        label="First Name",
+        placeholder="Your first name",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=50,
+    )
+    last_name = discord.ui.TextInput(
+        label="Last Name",
+        placeholder="Your last name",
+        style=discord.TextStyle.short,
+        required=True,
+        max_length=50,
+    )
+
+    def __init__(self, selected_role_keys: List[str], selected_cert_keys: List[str]):
+        super().__init__()
+        self.selected_role_keys = selected_role_keys
+        self.selected_cert_keys = selected_cert_keys
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+        await process_onboarding(
+            interaction,
+            self.first_name.value,
+            self.last_name.value,
+            self.selected_role_keys,
+            self.selected_cert_keys,
+        )
+
+
+class OnboardingRoleSelect(discord.ui.Select):
+    """Multi-select dropdown for role selection during onboarding."""
+
+    def __init__(self, options: List[discord.SelectOption]):
+        super().__init__(
+            placeholder="Select your roles...",
+            custom_id="onboarding_role_select",
+            min_values=1,
+            max_values=len(options) if options else 1,
+            options=options or [discord.SelectOption(label="No roles configured", value="_none")],
+            row=0,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        if uid not in _onboarding_selections:
+            _onboarding_selections[uid] = {"roles": [], "certifications": []}
+        _onboarding_selections[uid]["roles"] = self.values
+        labels = []
+        for key in self.values:
+            for r in ROLES:
+                if r["key"] == key:
+                    labels.append(r["label"])
+                    break
+        await interaction.response.send_message(
+            f"Roles selected: {', '.join(labels)}. Click **Join** when ready.",
+            ephemeral=True,
+        )
+
+
+class OnboardingCertSelect(discord.ui.Select):
+    """Multi-select dropdown for certification selection during onboarding."""
+
+    def __init__(self, options: List[discord.SelectOption]):
+        super().__init__(
+            placeholder="Select your certifications...",
+            custom_id="onboarding_cert_select",
+            min_values=1,
+            max_values=len(options) if options else 1,
+            options=options or [discord.SelectOption(label="No certifications configured", value="_none")],
+            row=1,
+        )
+
+    async def callback(self, interaction: discord.Interaction):
+        uid = interaction.user.id
+        if uid not in _onboarding_selections:
+            _onboarding_selections[uid] = {"roles": [], "certifications": []}
+        _onboarding_selections[uid]["certifications"] = self.values
+        labels = []
+        for key in self.values:
+            for c in CERTIFICATIONS:
+                if c["key"] == key:
+                    labels.append(c["label"])
+                    break
+        await interaction.response.send_message(
+            f"Certifications selected: {', '.join(labels)}. Click **Join** when ready.",
+            ephemeral=True,
+        )
+
+
+class OnboardingView(discord.ui.View):
+    """Persistent view with role select + certification select + Join button."""
+
+    def __init__(
+        self,
+        role_options: Optional[List[discord.SelectOption]] = None,
+        cert_options: Optional[List[discord.SelectOption]] = None,
+    ):
+        super().__init__(timeout=None)
+        if role_options:
+            self.add_item(OnboardingRoleSelect(role_options))
+        if cert_options:
+            self.add_item(OnboardingCertSelect(cert_options))
+
+    @discord.ui.button(
+        label="Join",
+        style=discord.ButtonStyle.success,
+        custom_id="onboarding_join",
+        row=2,
+    )
+    async def join_button(self, interaction: discord.Interaction, button: discord.ui.Button):
+        selected = _onboarding_selections.pop(interaction.user.id, None)
+        if not selected or (not selected.get("roles") and not selected.get("certifications")):
+            await interaction.response.send_message(
+                "Please select at least one role or certification from the dropdowns first.",
+                ephemeral=True,
+            )
+            return
+
+        # If user already has a profile, skip the name modal
+        profile = await db_get_member_profile(interaction.user.id)
+        if profile:
+            await interaction.response.defer(ephemeral=True)
+            await process_onboarding(
+                interaction,
+                profile["first_name"],
+                profile["last_name"],
+                selected.get("roles", []),
+                selected.get("certifications", []),
+            )
+            return
+
+        modal = OnboardingModal(
+            selected_role_keys=selected.get("roles", []),
+            selected_cert_keys=selected.get("certifications", []),
+        )
+        await interaction.response.send_modal(modal)
+
+
+class SubmitCertsModal(discord.ui.Modal, title="Submit Certification Numbers"):
+    """Dynamic modal with up to 5 cert number text inputs."""
+
+    def __init__(self, pending: List[Dict[str, Any]]):
+        super().__init__()
+        self.pending_roles = pending[:5]
+
+        for p in self.pending_roles:
+            cfg = _get_verifiable_config(p["role_key"])
+            label = cfg["cert_label"] if cfg else f"{p['role_key']} Cert #"
+            placeholder = cfg["cert_placeholder"] if cfg else "Enter certification number"
+            self.add_item(
+                discord.ui.TextInput(
+                    label=label[:45],
+                    placeholder=placeholder[:100],
+                    style=discord.TextStyle.short,
+                    required=True,
+                    max_length=100,
+                    custom_id=f"cert_{p['role_key']}",
+                )
+            )
+
+    async def on_submit(self, interaction: discord.Interaction):
+        await interaction.response.defer(ephemeral=True)
+
+        member = interaction.user
+        guild = interaction.guild
+
+        submitted = []
+        for child in self.children:
+            if isinstance(child, discord.ui.TextInput) and child.custom_id.startswith("cert_"):
+                role_key = child.custom_id[5:]  # strip "cert_"
+                cert_number = child.value.strip()
+                if cert_number:
+                    await db_submit_cert_number(member.id, role_key, cert_number)
+                    submitted.append(role_key)
+
+        # Check remaining pending certs
+        remaining = await db_get_pending_certs(member.id)
+
+        if not remaining:
+            # All verified — swap Unverified → Verified
+            if UNVERIFIED_ROLE_ID:
+                unverified = guild.get_role(UNVERIFIED_ROLE_ID)
+                if unverified:
+                    try:
+                        await member.remove_roles(unverified, reason="All certs verified")
+                    except discord.Forbidden:
+                        pass
+            if VERIFIED_ROLE_ID:
+                verified = guild.get_role(VERIFIED_ROLE_ID)
+                if verified:
+                    try:
+                        await member.add_roles(verified, reason="All certs verified")
+                    except discord.Forbidden:
+                        pass
+
+            status_msg = "All certifications submitted! You are now **Verified**."
+        else:
+            remaining_labels = []
+            for r in remaining:
+                cfg = _get_verifiable_config(r["role_key"])
+                remaining_labels.append(cfg["label"] if cfg else r["role_key"])
+            status_msg = (
+                f"Certifications submitted for {len(submitted)} certification(s). "
+                f"Still pending: {', '.join(remaining_labels)}. "
+                f"Run `/submit-certs` again to complete."
+            )
+
+        # Sync to SheetDB
+        all_member_roles = await db_get_member_roles(member.id)
+        profile = await db_get_member_profile(member.id)
+        if profile:
+            roles_str = _build_roles_string(all_member_roles)
+            certs_str = _build_certs_string(all_member_roles)
+            sync_status = "Verified" if not remaining else "Unverified"
+            await sync_member_to_sheetdb(
+                member.id,
+                profile["first_name"],
+                profile["last_name"],
+                profile["joined_at_utc"][:10],
+                certs_str,
+                roles_str,
+                sync_status,
+            )
+
+        await interaction.followup.send(status_msg, ephemeral=True)
+
+
+def _build_onboarding_view() -> OnboardingView:
+    """Build an OnboardingView with select options from current config."""
+    role_options = [
+        discord.SelectOption(
+            label=r["label"],
+            value=r["key"],
+            description=r.get("description", "")[:100],
+        )
+        for r in ROLES
+    ] or None
+    cert_options = [
+        discord.SelectOption(
+            label=c["label"],
+            value=c["key"],
+            description=c.get("description", "")[:100],
+        )
+        for c in CERTIFICATIONS
+    ] or None
+    return OnboardingView(role_options=role_options, cert_options=cert_options)
 
 
 # =========================
@@ -1202,6 +2166,7 @@ class DispatchView(discord.ui.View):
 
 intents = discord.Intents.default()
 intents.guilds = True
+intents.members = True
 
 client = discord.Client(intents=intents)
 tree = app_commands.CommandTree(client)
@@ -1235,6 +2200,68 @@ async def dispatch(
 
     await interaction.response.defer(ephemeral=True)
 
+    is_training = severity.lower().strip() == "training"
+
+    channel = interaction.guild.get_channel(DISPATCH_CHANNEL_ID)
+    if channel is None:
+        await interaction.followup.send(
+            "Dispatch channel not found. Check the channel ID.", ephemeral=True
+        )
+        return
+
+    if is_training:
+        # Training mode — no DB logging
+        now_local = local_now_for_id()
+        incident_id = f"TRAIN-{now_local.strftime('%Y%m%d-%H%M')}"
+        gps_url = "(training — no GPS)"
+
+        embed = build_dispatch_embed(
+            incident_id=incident_id,
+            reporter=interaction.user.display_name,
+            location=location,
+            severity="training",
+            patient_count=patient_count if patient_count is not None else 0,
+            patient_desc=patient_desc or "",
+            reported_injury=reported_injury or "",
+            notes=notes or "",
+            gps_url=gps_url,
+            is_training=True,
+        )
+
+        view = DispatchView(db_id=0, incident_id=incident_id, gps_url=gps_url, is_training=True)
+
+        msg = await channel.send(
+            content=f"**[TRAINING] Dispatch:** Incident **{incident_id}** reported.",
+            embed=embed,
+            view=view,
+        )
+
+        # Store channel message ID for cleanup
+        view._channel_message_id = msg.id
+
+        if CREATE_INCIDENT_THREAD:
+            try:
+                thread = await msg.create_thread(name=f"[TRAINING] {incident_id}")
+                # Send buttons into the thread so responders can interact from there
+                thread_view = DispatchView(db_id=0, incident_id=incident_id, gps_url=gps_url, is_training=True)
+                thread_view._channel_message_id = msg.id
+                thread_view._training_responders = view._training_responders  # Share state
+                await thread.send(
+                    f"Training thread for **{incident_id}**. Use the buttons below to practice.",
+                    embed=embed.copy(),
+                    view=thread_view,
+                )
+            except Exception as e:
+                await channel.send(
+                    f"Could not create training thread for **{incident_id}**. Reason: {e}"
+                )
+
+        await interaction.followup.send(
+            f"Training dispatch created: **{incident_id}**", ephemeral=True
+        )
+        return
+
+    # Normal dispatch flow
     created = await db_create_incident(
         {
             "reporter_user_id": interaction.user.id,
@@ -1253,13 +2280,6 @@ async def dispatch(
     gps_token = created["gps_token"]
 
     gps_url = f"{PUBLIC_BASE_URL}/gps?incident_id={incident_id}&token={gps_token}"
-
-    channel = interaction.guild.get_channel(DISPATCH_CHANNEL_ID)
-    if channel is None:
-        await interaction.followup.send(
-            "Dispatch channel not found. Check the channel ID.", ephemeral=True
-        )
-        return
 
     ping = f"<@&{DISPATCH_PING_ROLE_ID}> " if DISPATCH_PING_ROLE_ID else ""
 
@@ -1462,13 +2482,128 @@ async def incident_search(
         )
 
 
+@tree.command(
+    name="submit-certs",
+    description="Submit certification numbers for your certifications.",
+)
+async def submit_certs(interaction: discord.Interaction):
+    pending = await db_get_pending_certs(interaction.user.id)
+    if not pending:
+        # Check if user has requires_verification roles but no certification rows at all
+        all_member_roles = await db_get_member_roles(interaction.user.id)
+        cert_keys = {c["key"] for c in CERTIFICATIONS}
+        has_cert_rows = any(mr["role_key"] in cert_keys for mr in all_member_roles)
+        verify_role_keys = {r["key"] for r in ROLES if r.get("requires_verification")}
+        has_verify_role = any(mr["role_key"] in verify_role_keys for mr in all_member_roles)
+
+        if has_verify_role and not has_cert_rows:
+            await interaction.response.send_message(
+                "You have roles that require verification but no certifications on file yet. "
+                "Go back to the role channel and select your certifications from the dropdown.",
+                ephemeral=True,
+            )
+        else:
+            await interaction.response.send_message(
+                "All certifications verified! You have no pending cert submissions.",
+                ephemeral=True,
+            )
+        return
+
+    if len(pending) > 5:
+        await interaction.response.send_modal(SubmitCertsModal(pending[:5]))
+    else:
+        await interaction.response.send_modal(SubmitCertsModal(pending))
+
+
+@tree.command(
+    name="reload-roles",
+    description="(Admin) Reload roles_config.json without restarting the bot.",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def reload_roles(interaction: discord.Interaction):
+    try:
+        load_roles_config()
+        verify_count = sum(1 for r in ROLES if r.get("requires_verification"))
+        await interaction.response.send_message(
+            f"Roles config reloaded: {len(ROLES)} roles ({verify_count} require verification), "
+            f"{len(CERTIFICATIONS)} certifications.\n"
+            "Note: Any existing onboarding embeds still show the old options. "
+            "Run `/setup-certifications` again to post an updated one.",
+            ephemeral=True,
+        )
+    except Exception as e:
+        await interaction.response.send_message(
+            f"Failed to reload config: {e}", ephemeral=True
+        )
+
+
+@tree.command(
+    name="setup-certifications",
+    description="(Admin) Post the role selection embed in this channel.",
+)
+@app_commands.default_permissions(manage_guild=True)
+async def setup_certifications(interaction: discord.Interaction):
+    if not ROLES and not CERTIFICATIONS:
+        await interaction.response.send_message(
+            "No roles or certifications are configured yet. Edit `roles_config.json` and set `discord_role_id` values, then restart.",
+            ephemeral=True,
+        )
+        return
+
+    embed = discord.Embed(
+        title="Role Selection & Certification Verification",
+        description=(
+            "Welcome! Select the roles and/or certifications that apply to you "
+            "from the dropdowns below, then click **Join** to get started.\n\n"
+            "Some roles require verification. Certifications require you to "
+            "submit your cert numbers with `/submit-certs` to become Verified."
+        ),
+        color=discord.Color.blurple(),
+    )
+
+    general_roles = [r for r in ROLES if not r.get("requires_verification")]
+    verify_roles = [r for r in ROLES if r.get("requires_verification")]
+
+    if general_roles:
+        general_list = "\n".join(f"• **{r['label']}** — {r.get('description', '')}" for r in general_roles)
+        embed.add_field(name="Roles (no verification required)", value=general_list, inline=False)
+
+    if verify_roles:
+        verify_list = "\n".join(f"• **{r['label']}** — {r.get('description', '')}" for r in verify_roles)
+        embed.add_field(name="Roles (verification required)", value=verify_list, inline=False)
+
+    if CERTIFICATIONS:
+        cert_list = "\n".join(f"• **{c['label']}** — {c.get('description', '')}" for c in CERTIFICATIONS)
+        embed.add_field(name="Certifications", value=cert_list, inline=False)
+
+    embed.set_footer(text="You can come back and add more roles anytime.")
+
+    view = _build_onboarding_view()
+    await interaction.response.defer(ephemeral=True)
+    await interaction.channel.send(embed=embed, view=view)
+    await interaction.followup.send("Certification embed posted!", ephemeral=True)
+
+
 @client.event
 async def on_ready():
-    await db_init()
     try:
-        await tree.sync()
+        load_roles_config()
     except Exception as e:
-        print("Command sync failed:", e)
+        print(f"ERROR: Failed to load roles config: {e}")
+
+    await db_init()
+
+    try:
+        if DEV_GUILD_ID:
+            guild_obj = discord.Object(id=DEV_GUILD_ID)
+            tree.copy_global_to(guild=guild_obj)
+            await tree.sync(guild=guild_obj)
+            print(f"Commands synced to dev guild {DEV_GUILD_ID} (instant)")
+        else:
+            await tree.sync()
+            print("Commands synced globally (may take up to 1 hour)")
+    except Exception as e:
+        print(f"Command sync failed: {e}")
 
     # Re-register views for all open incidents so buttons work after restart
     try:
@@ -1498,7 +2633,43 @@ async def on_ready():
     except Exception as e:
         print(f"Warning: Could not re-register views: {e}")
 
+    # Register persistent onboarding view (handles dropdown + Join from any posted embed)
+    if ROLES or CERTIFICATIONS:
+        client.add_view(_build_onboarding_view())
+        print("Onboarding view registered")
+
+    # Re-register pending approval views
+    try:
+        pending_approvals = await db_get_all_pending_approvals()
+        for pa in pending_approvals:
+            view = RoleApprovalView(
+                user_id=pa["user_id"],
+                role_key=pa["role_key"],
+                approval_id=pa["id"],
+            )
+            client.add_view(view, message_id=pa["discord_message_id"])
+        print(f"Re-registered {len(pending_approvals)} approval views")
+    except Exception as e:
+        print(f"Warning: Could not re-register approval views: {e}")
+
     print(f"MedBot logged in as {client.user}.")
+
+
+@client.event
+async def on_app_command_completion(interaction: discord.Interaction, command: app_commands.Command):
+    guild_name = interaction.guild.name if interaction.guild else "DM"
+    print(f"[CMD] /{command.name} used by {interaction.user} ({interaction.user.id}) in #{interaction.channel} [{guild_name}]")
+
+
+@tree.error
+async def on_app_command_error(interaction: discord.Interaction, error: app_commands.AppCommandError):
+    guild_name = interaction.guild.name if interaction.guild else "DM"
+    cmd_name = interaction.command.name if interaction.command else "unknown"
+    print(f"[CMD ERROR] /{cmd_name} by {interaction.user} ({interaction.user.id}) in #{interaction.channel} [{guild_name}]: {error}")
+    if not interaction.response.is_done():
+        await interaction.response.send_message(
+            "Something went wrong running that command.", ephemeral=True
+        )
 
 
 # =========================

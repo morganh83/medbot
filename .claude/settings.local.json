@@ -6,7 +6,8 @@
       "Bash(git commit -m \"$\\(cat <<''EOF''\nAdd Docker support and health check endpoint\n\n- Add Dockerfile with multi-stage build for production deployment\n- Add docker-compose.yml with health checks and volume mounts  \n- Add .dockerignore for optimized builds\n- Add /health endpoint for monitoring and Docker health checks\n\n🤖 Generated with [Claude Code]\\(https://claude.com/claude-code\\)\n\nCo-Authored-By: Claude Sonnet 4.5 <noreply@anthropic.com>\nEOF\n\\)\")",
       "Bash(git commit:*)",
       "Bash(git push:*)",
-      "Bash(ls:*)"
+      "Bash(ls:*)",
+      "Bash(python -m py_compile:*)"
     ]
   }
 }

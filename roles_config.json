@@ -1,0 +1,84 @@
+{
+  "roles": [
+    {
+      "key": "dispatcher",
+      "label": "Dispatcher",
+      "discord_role_id": 1470862323408437380,
+      "description": "Dispatch coordination and communication",
+      "requires_verification": false
+    },
+    {
+      "key": "volunteer",
+      "label": "Volunteer",
+      "discord_role_id": 1470879385077678201,
+      "description": "General volunteer support",
+      "requires_verification": false
+    },
+    {
+      "key": "logistics",
+      "label": "Logistics / Support",
+      "discord_role_id": 1470879482024956098,
+      "description": "Logistics and support operations",
+      "requires_verification": false
+    },
+    {
+      "key": "sectionleader",
+      "label": "Section Leader",
+      "discord_role_id": 1470880546421870767,
+      "description": "Logistics and support operations",
+      "requires_verification": false,
+      "requires_approval": true
+    },
+    {
+      "key": "responder",
+      "label": "Responder",
+      "discord_role_id": 1470862343993823294,
+      "description": "Emergency medical responder",
+      "requires_verification": true
+    },
+    {
+      "key": "adv_responder",
+      "label": "Advanced Responder",
+      "discord_role_id": 1470862367880646816,
+      "description": "Advanced emergency medical responder",
+      "requires_verification": true
+    }
+  ],
+  "certifications": [
+    {
+      "key": "emt_basic",
+      "label": "EMT-Basic",
+      "discord_role_id": 908021564434448415,
+      "description": "Emergency Medical Technician - Basic",
+      "cert_label": "EMT-Basic Certification #",
+      "cert_placeholder": "e.g., NREMT or state license number"
+    },
+    {
+      "key": "paramedic",
+      "label": "Paramedic",
+      "discord_role_id": 908021661872291840,
+      "description": "Licensed paramedic",
+      "cert_label": "Paramedic Certification #",
+      "cert_placeholder": "e.g., NREMT or state license number"
+    },
+    {
+      "key": "first_aid_cpr",
+      "label": "First Aid / CPR / AED",
+      "discord_role_id": 1470862258153455707,
+      "description": "First Aid, CPR, and AED certified",
+      "cert_label": "First Aid/CPR/AED Certification #",
+      "cert_placeholder": "e.g., AHA or Red Cross cert number"
+    },
+    {
+      "key": "radio_operator",
+      "label": "Communications / Radio Operator",
+      "discord_role_id": 0,
+      "description": "Communications and radio operator",
+      "cert_label": "Radio Operator License #",
+      "cert_placeholder": "e.g., FCC call sign or license number"
+    }
+  ],
+  "verified_role_id": 1470885469876388133,
+  "unverified_role_id": 1470885298337743025,
+  "pending_approval_role_id": 0
+}
