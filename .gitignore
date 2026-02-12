@@ -2,3 +2,4 @@ venv/
 .env
 claude/
 *.pyc
+roles_config.json

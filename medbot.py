@@ -1,5 +1,6 @@
 import json
 import os
+import shutil
 import asyncio
 import datetime as dt
 import secrets
@@ -81,9 +82,23 @@ UNVERIFIED_ROLE_ID: int = 0
 PENDING_APPROVAL_ROLE_ID: int = 0
 
 
+ROLES_TEMPLATE_PATH = os.path.join(os.path.dirname(ROLES_CONFIG_PATH), "roles_config.template.json")
+
+
 def load_roles_config():
-    """Load and validate roles from the JSON config file."""
+    """Load and validate roles from the JSON config file.
+
+    If roles_config.json doesn't exist, copies from roles_config.template.json.
+    """
     global ROLES, CERTIFICATIONS, ALL_ITEMS, VERIFIED_ROLE_ID, UNVERIFIED_ROLE_ID, PENDING_APPROVAL_ROLE_ID
+
+    if not os.path.exists(ROLES_CONFIG_PATH):
+        if os.path.exists(ROLES_TEMPLATE_PATH):
+            shutil.copy2(ROLES_TEMPLATE_PATH, ROLES_CONFIG_PATH)
+            print(f"Created {ROLES_CONFIG_PATH} from template. Edit it to set your Discord role IDs.")
+        else:
+            print(f"ERROR: Neither {ROLES_CONFIG_PATH} nor {ROLES_TEMPLATE_PATH} found.")
+            return
 
     with open(ROLES_CONFIG_PATH, "r", encoding="utf-8") as f:
         cfg = json.load(f)
@@ -588,8 +603,8 @@ async def db_get_member_roles(user_id: int) -> List[Dict[str, Any]]:
 
 
 async def db_get_pending_certs(user_id: int) -> List[Dict[str, Any]]:
-    """Get certification rows that still need a cert number submitted."""
-    cert_keys = {c["key"] for c in CERTIFICATIONS}
+    """Get certification rows that still need a cert number or date submitted."""
+    verifiable_keys = {c["key"] for c in CERTIFICATIONS if c.get("verification", "cert_number") != "none"}
     async with aiosqlite.connect(DB_PATH) as db:
         db.row_factory = aiosqlite.Row
         cur = await db.execute(
@@ -597,7 +612,7 @@ async def db_get_pending_certs(user_id: int) -> List[Dict[str, Any]]:
             (user_id,),
         )
         rows = await cur.fetchall()
-        return [dict(r) for r in rows if r["role_key"] in cert_keys]
+        return [dict(r) for r in rows if r["role_key"] in verifiable_keys]
 
 
 async def db_submit_cert_number(user_id: int, role_key: str, cert_number: str):
@@ -1859,12 +1874,16 @@ async def process_onboarding(
             print(f"WARNING: Role ID {c['discord_role_id']} for '{c['label']}' not found in guild")
             failed_labels.append(c["label"])
         await db_insert_member_role(member.id, c["key"], "certification", c["discord_role_id"])
+        # For "none" verification items, mark as self-reported so they don't appear pending
+        if c.get("verification") == "none":
+            await db_submit_cert_number(member.id, c["key"], "self-reported")
         assigned_labels.append(c["label"])
 
     # Handle verification status
+    verifiable_certs = [c for c in selected_certs if c.get("verification", "cert_number") != "none"]
     needs_verification = (
         any(r.get("requires_verification") for r in selected_roles)
-        or len(selected_certs) > 0
+        or len(verifiable_certs) > 0
     )
     already_verified = VERIFIED_ROLE_ID and any(r.id == VERIFIED_ROLE_ID for r in member.roles)
     if needs_verification and not already_verified and UNVERIFIED_ROLE_ID:
@@ -1903,8 +1922,8 @@ async def process_onboarding(
         )
     if needs_verification:
         lines.append(
-            "\nYou have roles/certifications that require verification. "
-            "Use `/submit-certs` to submit your certification numbers and get verified."
+            "\nYou have credentials that require verification. "
+            "Use `/submit-certs` to submit your certification numbers or course dates and get verified."
         )
     await interaction.followup.send("\n".join(lines), ephemeral=True)
 
@@ -2050,8 +2069,8 @@ class OnboardingView(discord.ui.View):
         await interaction.response.send_modal(modal)
 
 
-class SubmitCertsModal(discord.ui.Modal, title="Submit Certification Numbers"):
-    """Dynamic modal with up to 5 cert number text inputs."""
+class SubmitCertsModal(discord.ui.Modal, title="Submit Credentials"):
+    """Dynamic modal with up to 5 cert number / course date text inputs."""
 
     def __init__(self, pending: List[Dict[str, Any]]):
         super().__init__()
@@ -2107,14 +2126,14 @@ class SubmitCertsModal(discord.ui.Modal, title="Submit Certification Numbers"):
                     except discord.Forbidden:
                         pass
 
-            status_msg = "All certifications submitted! You are now **Verified**."
+            status_msg = "All credentials submitted! You are now **Verified**."
         else:
             remaining_labels = []
             for r in remaining:
                 cfg = _get_verifiable_config(r["role_key"])
                 remaining_labels.append(cfg["label"] if cfg else r["role_key"])
             status_msg = (
-                f"Certifications submitted for {len(submitted)} certification(s). "
+                f"Credentials submitted for {len(submitted)} item(s). "
                 f"Still pending: {', '.join(remaining_labels)}. "
                 f"Run `/submit-certs` again to complete."
             )

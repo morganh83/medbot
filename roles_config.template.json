@@ -1,0 +1,262 @@
+{
+  "_comment": "TEMPLATE — Copy this file to roles_config.json and fill in your Discord role IDs. roles_config.json is gitignored so your local config won't be overwritten by updates.",
+
+  "roles": [
+    {
+      "key": "dispatch",
+      "label": "Dispatch",
+      "discord_role_id": 0,
+      "description": "Dispatch coordination and communication",
+      "requires_verification": false
+    },
+    {
+      "key": "volunteer",
+      "label": "Volunteer",
+      "discord_role_id": 0,
+      "description": "General volunteer support",
+      "requires_verification": false
+    },
+    {
+      "key": "logistics",
+      "label": "Logistics / Support",
+      "discord_role_id": 0,
+      "description": "Logistics and support operations",
+      "requires_verification": false
+    },
+    {
+      "key": "sectionleader",
+      "label": "Section Leader",
+      "discord_role_id": 0,
+      "description": "Section leadership and coordination",
+      "requires_verification": false,
+      "requires_approval": true
+    },
+    {
+      "key": "responder",
+      "label": "Responder",
+      "discord_role_id": 0,
+      "description": "Emergency medical responder",
+      "requires_verification": true
+    },
+    {
+      "key": "adv_responder",
+      "label": "Advanced Responder",
+      "discord_role_id": 0,
+      "description": "Advanced emergency medical responder",
+      "requires_verification": true
+    },
+    {
+      "key": "organizer",
+      "label": "Event Organizer",
+      "discord_role_id": 0,
+      "description": "Work with organizations to plan and prepare for SMART involvement.",
+      "requires_verification": false,
+      "requires_approval": true
+    },
+  ],
+
+  "certifications": [
+    {
+      "key": "paramedic",
+      "label": "Paramedic",
+      "discord_role_id": 0,
+      "description": "Licensed paramedic",
+      "verification": "cert_number",
+      "cert_label": "Paramedic License #",
+      "cert_placeholder": "e.g., NREMT or state license number"
+    },
+    {
+      "key": "emt_basic",
+      "label": "EMT",
+      "discord_role_id": 0,
+      "description": "Emergency Medical Technician — Basic",
+      "verification": "cert_number",
+      "cert_label": "EMT Certification #",
+      "cert_placeholder": "e.g., NREMT or state license number"
+    },
+    {
+      "key": "emt_advanced",
+      "label": "AEMT",
+      "discord_role_id": 0,
+      "description": "Advanced Emergency Medical Technician",
+      "verification": "cert_number",
+      "cert_label": "AEMT Certification #",
+      "cert_placeholder": "e.g., NREMT or state license number"
+    },
+    {
+      "key": "first_aid",
+      "label": "First Aid",
+      "discord_role_id": 0,
+      "description": "First Aid certified or course completed",
+      "verification": "course_date",
+      "cert_label": "First Aid — Last Completed",
+      "cert_placeholder": "e.g., March 2025"
+    },
+    {
+      "key": "cpr",
+      "label": "CPR",
+      "discord_role_id": 0,
+      "description": "CPR certified or course completed",
+      "verification": "course_date",
+      "cert_label": "CPR — Last Completed",
+      "cert_placeholder": "e.g., March 2025"
+    },
+    {
+      "key": "aed",
+      "label": "AED",
+      "discord_role_id": 0,
+      "description": "AED trained or certified",
+      "verification": "course_date",
+      "cert_label": "AED — Last Completed",
+      "cert_placeholder": "e.g., March 2025"
+    },
+    {
+      "key": "cls",
+      "label": "Combat Life Saver (CLS)",
+      "discord_role_id": 0,
+      "description": "Military Combat Life Saver course",
+      "verification": "course_date",
+      "cert_label": "CLS — Last Completed",
+      "cert_placeholder": "e.g., March 2025"
+    },
+    {
+      "key": "stop_the_bleed",
+      "label": "ACS Stop the Bleed",
+      "discord_role_id": 0,
+      "description": "American College of Surgeons Stop the Bleed course",
+      "verification": "course_date",
+      "cert_label": "Stop the Bleed — Last Completed",
+      "cert_placeholder": "e.g., March 2025"
+    },
+    {
+      "key": "o2_provider",
+      "label": "O2 Provider",
+      "discord_role_id": 0,
+      "description": "Emergency Oxygen Provider certified",
+      "verification": "course_date",
+      "cert_label": "O2 Provider — Last Completed",
+      "cert_placeholder": "e.g., March 2025"
+    },
+    {
+      "key": "acls",
+      "label": "ACLS",
+      "discord_role_id": 0,
+      "description": "Advanced Cardiovascular Life Support",
+      "verification": "cert_number",
+      "cert_label": "ACLS Certification #",
+      "cert_placeholder": "e.g., AHA card number"
+    },
+    {
+      "key": "phtls",
+      "label": "PHTLS",
+      "discord_role_id": 0,
+      "description": "Prehospital Trauma Life Support",
+      "verification": "cert_number",
+      "cert_label": "PHTLS Certification #",
+      "cert_placeholder": "e.g., NAEMT cert number"
+    },
+    {
+      "key": "itls",
+      "label": "ITLS",
+      "discord_role_id": 0,
+      "description": "International Trauma Life Support",
+      "verification": "cert_number",
+      "cert_label": "ITLS Certification #",
+      "cert_placeholder": "e.g., ITLS cert number"
+    },
+    {
+      "key": "tccc",
+      "label": "TCCC",
+      "discord_role_id": 0,
+      "description": "Tactical Combat Casualty Care",
+      "verification": "course_date",
+      "cert_label": "TCCC — Last Completed",
+      "cert_placeholder": "e.g., March 2025"
+    },
+    {
+      "key": "tecc",
+      "label": "TECC",
+      "discord_role_id": 0,
+      "description": "Tactical Emergency Casualty Care (civilian TCCC)",
+      "verification": "course_date",
+      "cert_label": "TECC — Last Completed",
+      "cert_placeholder": "e.g., March 2025"
+    },
+    {
+      "key": "rn",
+      "label": "Registered Nurse (RN)",
+      "discord_role_id": 0,
+      "description": "Licensed Registered Nurse",
+      "verification": "cert_number",
+      "cert_label": "RN License #",
+      "cert_placeholder": "e.g., state license number"
+    },
+    {
+      "key": "lpn",
+      "label": "Licensed Practical Nurse (LPN)",
+      "discord_role_id": 0,
+      "description": "Licensed Practical Nurse",
+      "verification": "cert_number",
+      "cert_label": "LPN License #",
+      "cert_placeholder": "e.g., state license number"
+    },
+    {
+      "key": "np",
+      "label": "Nurse Practitioner (NP)",
+      "discord_role_id": 0,
+      "description": "Licensed Nurse Practitioner",
+      "verification": "cert_number",
+      "cert_label": "NP License #",
+      "cert_placeholder": "e.g., state license number"
+    },
+    {
+      "key": "pa",
+      "label": "Physician Assistant (PA)",
+      "discord_role_id": 0,
+      "description": "Licensed Physician Assistant",
+      "verification": "cert_number",
+      "cert_label": "PA License #",
+      "cert_placeholder": "e.g., NCCPA or state license number"
+    },
+    {
+      "key": "physician",
+      "label": "Physician (MD/DO)",
+      "discord_role_id": 0,
+      "description": "Licensed physician (MD or DO)",
+      "verification": "cert_number",
+      "cert_label": "Physician License #",
+      "cert_placeholder": "e.g., state medical license number"
+    },
+    {
+      "key": "rt",
+      "label": "Respiratory Therapist (RT)",
+      "discord_role_id": 0,
+      "description": "Licensed Respiratory Therapist",
+      "verification": "cert_number",
+      "cert_label": "RT License #",
+      "cert_placeholder": "e.g., NBRC or state license number"
+    },
+    {
+      "key": "combat_medic",
+      "label": "Combat Medic (68W)",
+      "discord_role_id": 0,
+      "description": "US Army Combat Medic (MOS 68W)",
+      "verification": "none",
+      "cert_label": "",
+      "cert_placeholder": ""
+    },
+    {
+      "key": "corpsman",
+      "label": "Hospital Corpsman (HM)",
+      "discord_role_id": 0,
+      "description": "US Navy Hospital Corpsman",
+      "verification": "none",
+      "cert_label": "",
+      "cert_placeholder": ""
+    }
+  ],
+
+  "verified_role_id": 0,
+  "unverified_role_id": 0,
+  "pending_approval_role_id": 0
+}
