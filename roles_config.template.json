@@ -52,7 +52,7 @@
       "description": "Work with organizations to plan and prepare for SMART involvement.",
       "requires_verification": false,
       "requires_approval": true
-    },
+    }
   ],
 
   "certifications": [
